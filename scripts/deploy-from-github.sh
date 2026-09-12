@@ -19,6 +19,8 @@ venv="/opt/loxone-bronze/venv"
 collector="loxone-bronze-collector.service"
 uploader="loxone-bronze-uploader.service"
 timer="loxone-bronze-uploader.timer"
+state_dir="/var/lib/loxone-bronze"
+last_good_file="$state_dir/deployed-commit"
 
 exec 9>/run/lock/loxone-bronze-deploy.lock
 if ! flock -n 9; then
@@ -33,7 +35,18 @@ for required in "$repo/.git" "$venv/bin/pip"; do
   }
 done
 
-previous_sha="$(runuser -u "$repo_user" -- git -C "$repo" rev-parse HEAD)"
+current_sha="$(runuser -u "$repo_user" -- git -C "$repo" rev-parse HEAD)"
+previous_sha="$current_sha"
+if [[ -s "$last_good_file" ]]; then
+  candidate_sha="$(tr -d '[:space:]' < "$last_good_file")"
+  if [[ "$candidate_sha" =~ ^[0-9a-f]{40}$ ]] && \
+     runuser -u "$repo_user" -- git -C "$repo" cat-file -e "${candidate_sha}^{commit}" 2>/dev/null; then
+    previous_sha="$candidate_sha"
+  else
+    echo "Ignoring invalid last-known-good commit in $last_good_file; falling back to $current_sha." >&2
+  fi
+fi
+
 timer_was_active=false
 if systemctl is-active --quiet "$timer"; then
   timer_was_active=true
@@ -66,7 +79,7 @@ install_units() {
 rollback() {
   local exit_code="$?"
   trap - ERR
-  echo "Deployment failed; restoring $previous_sha." >&2
+  echo "Deployment failed; restoring last known good commit $previous_sha." >&2
 
   systemctl stop "$timer" || true
   systemctl stop "$uploader" || true
@@ -95,6 +108,7 @@ if [[ "$remote_sha" != "$expected_sha" ]]; then
 fi
 
 echo "Deploying Loxone Bronze commit $expected_sha"
+echo "Rollback target is $previous_sha"
 systemctl stop "$timer"
 systemctl stop "$uploader" || true
 systemctl stop "$collector"
@@ -117,12 +131,18 @@ if "$timer_was_active"; then
 fi
 
 # A running process is not enough: after reconnect the collector must write fresh
-# data to the spool. Failure here is treated as a failed deployment and rolls back.
+# data to the spool. Historical uploader backlog is deliberately excluded here;
+# it is operational health, not evidence that this deployment broke the collector.
 sleep 15
 runuser -u loxonebronze -- env \
   SPOOL_DB=/var/lib/loxone-bronze/spool.sqlite3 \
   HEALTH_MAX_EVENT_AGE_MINUTES=2 \
+  HEALTH_CHECK_BACKLOG=false \
   "$venv/bin/loxone-bronze-health"
+
+install -d -m 0755 "$state_dir"
+printf '%s\n' "$expected_sha" > "$last_good_file"
+chmod 0644 "$last_good_file"
 
 trap - ERR
 echo "Deployment completed and passed post-deploy health check: $expected_sha"
