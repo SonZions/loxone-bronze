@@ -116,5 +116,13 @@ if "$timer_was_active"; then
   systemctl is-active --quiet "$timer"
 fi
 
+# A running process is not enough: after reconnect the collector must write fresh
+# data to the spool. Failure here is treated as a failed deployment and rolls back.
+sleep 15
+runuser -u loxonebronze -- env \
+  SPOOL_DB=/var/lib/loxone-bronze/spool.sqlite3 \
+  HEALTH_MAX_EVENT_AGE_MINUTES=2 \
+  "$venv/bin/loxone-bronze-health"
+
 trap - ERR
-echo "Deployment completed: $expected_sha"
+echo "Deployment completed and passed post-deploy health check: $expected_sha"
