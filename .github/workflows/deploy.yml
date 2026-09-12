@@ -1,0 +1,28 @@
+name: Deploy Loxone Bronze
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: loxone-bronze-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy approved main revision
+    runs-on: [self-hosted, Linux, ARM64]
+    environment:
+      name: loxberry-production
+    timeout-minutes: 10
+
+    steps:
+      - name: Show approved revision
+        run: |
+          echo "Approved commit: $GITHUB_SHA"
+          echo "The deployment bridge accepts only this exact origin/main commit."
+
+      - name: Deploy through the restricted bridge
+        run: sudo -n /usr/local/sbin/loxone-bronze-deploy "$GITHUB_SHA"
