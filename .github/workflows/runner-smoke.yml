@@ -1,0 +1,32 @@
+name: Runner smoke test
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    name: Raspberry Pi runner
+    runs-on: [self-hosted, loxberry]
+    timeout-minutes: 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Host facts
+        run: |
+          uname -a
+          echo
+          echo "=== Filesystems ==="
+          df -h / /srv/raspi-data
+          echo
+          echo "=== Runtime ==="
+          python3 --version
+          git --version
+
+      - name: Validate project source
+        run: |
+          python3 -m compileall -q src
+          git status --short
