@@ -1,0 +1,19 @@
+# Secrets
+*.env
+!*.env.example
+*.pem
+*.key
+
+# Local state and databases
+*.sqlite
+*.sqlite3
+*.sqlite-*
+data/
+spool/
+
+# Python and logs
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.log

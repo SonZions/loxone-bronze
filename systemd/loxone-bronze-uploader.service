@@ -1,0 +1,21 @@
+[Unit]
+Description=Loxone Bronze MotherDuck Uploader
+After=network-online.target loxone-bronze-collector.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=loxonebronze
+Group=loxonebronze
+EnvironmentFile=/etc/loxone-bronze/motherduck.env
+ExecStart=/opt/loxone-bronze/venv/bin/loxone-bronze-uploader
+
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ReadWritePaths=/var/lib/loxone-bronze

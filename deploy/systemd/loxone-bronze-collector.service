@@ -1,0 +1,27 @@
+[Unit]
+Description=Loxone Bronze WebSocket Collector
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=loxonebronze
+Group=loxonebronze
+EnvironmentFile=/etc/loxone-bronze/collector.env
+ExecStart=/opt/loxone-bronze/venv/bin/loxone-bronze-collector
+Restart=always
+RestartSec=10
+TimeoutStopSec=20
+
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ReadWritePaths=/var/lib/loxone-bronze
+
+[Install]
+WantedBy=multi-user.target

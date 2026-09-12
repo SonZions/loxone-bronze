@@ -1,0 +1,4 @@
+[console_scripts]
+loxone-bronze-collector = loxone_bronze.collector:main
+loxone-bronze-health = loxone_bronze.health:main
+loxone-bronze-uploader = loxone_bronze.uploader:main

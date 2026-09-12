@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "loxone-bronze"
+version = "0.1.0"
+description = "Durable Loxone WebSocket event collector with local SQLite spool and MotherDuck Bronze uploader"
+requires-python = ">=3.10"
+dependencies = [
+  "duckdb>=1.4,<2",
+  "loxwebsocket==0.6.0",
+]
+
+[project.scripts]
+loxone-bronze-collector = "loxone_bronze.collector:main"
+loxone-bronze-uploader = "loxone_bronze.uploader:main"
+loxone-bronze-health = "loxone_bronze.health:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

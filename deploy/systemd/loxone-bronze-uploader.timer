@@ -1,0 +1,12 @@
+[Unit]
+Description=Upload Loxone Bronze spool to MotherDuck every 5 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+Persistent=true
+AccuracySec=15s
+Unit=loxone-bronze-uploader.service
+
+[Install]
+WantedBy=timers.target
