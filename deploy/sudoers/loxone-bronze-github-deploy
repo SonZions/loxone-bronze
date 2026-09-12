@@ -1,0 +1,4 @@
+# Allows only the fixed deployment bridge. The bridge validates the requested
+# SHA against origin/main before it touches the production service.
+Cmnd_Alias LOXONE_BRONZE_DEPLOY = /usr/local/sbin/loxone-bronze-deploy *
+github-runner ALL=(root) NOPASSWD: LOXONE_BRONZE_DEPLOY
