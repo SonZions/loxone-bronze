@@ -1,15 +1,16 @@
 from __future__ import annotations
 
 import sqlite3
+import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterable
 
 SCHEMA = """
 PRAGMA journal_mode=WAL;
-PRAGMA synchronous=FULL;
+PRAGMA synchronous=NORMAL;
 PRAGMA foreign_keys=ON;
-PRAGMA busy_timeout=5000;
+PRAGMA busy_timeout=10000;
 
 CREATE TABLE IF NOT EXISTS ws_messages (
     message_id TEXT PRIMARY KEY,
@@ -51,19 +52,41 @@ class Spool:
     def __init__(self, path: str):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        with self.connect() as con:
-            con.executescript(SCHEMA)
+        self._write(lambda con: con.executescript(SCHEMA))
 
     @contextmanager
     def connect(self):
         con = sqlite3.connect(self.path, timeout=10)
         con.row_factory = sqlite3.Row
         try:
-            con.execute("PRAGMA busy_timeout=5000")
+            con.execute("PRAGMA busy_timeout=10000")
+            con.execute("PRAGMA foreign_keys=ON")
+            con.execute("PRAGMA synchronous=NORMAL")
             yield con
             con.commit()
         finally:
             con.close()
+
+    def _write(self, operation):
+        """Run one SQLite write and retry temporary writer contention."""
+        for attempt in range(6):
+            try:
+                with self.connect() as con:
+                    return operation(con)
+            except sqlite3.OperationalError as exc:
+                message = str(exc).lower()
+                if "locked" not in message and "busy" not in message:
+                    raise
+                if attempt == 5:
+                    raise
+                time.sleep(0.25 * (attempt + 1))
+
+    def _mark(self, statement: str, rows) -> None:
+        for start in range(0, len(rows), 250):
+            batch = rows[start:start + 250]
+            self._write(
+                lambda con, batch=batch: con.executemany(statement, batch)
+            )
 
     def insert_message(
         self,
@@ -78,8 +101,8 @@ class Spool:
         payload_sha256: str,
         collector_version: str,
     ) -> None:
-        with self.connect() as con:
-            con.execute(
+        self._write(
+            lambda con: con.execute(
                 """
                 INSERT OR IGNORE INTO ws_messages (
                     message_id, source_id, run_id, received_at, message_type,
@@ -91,6 +114,7 @@ class Spool:
                     payload_format, payload_json, payload_sha256, collector_version,
                 ),
             )
+        )
 
     def insert_structure(
         self,
@@ -103,8 +127,8 @@ class Spool:
         payload_sha256: str,
         collector_version: str,
     ) -> None:
-        with self.connect() as con:
-            con.execute(
+        self._write(
+            lambda con: con.execute(
                 """
                 INSERT OR IGNORE INTO structures (
                     structure_id, source_id, captured_at, last_modified,
@@ -116,6 +140,7 @@ class Spool:
                     payload_json, payload_sha256, collector_version,
                 ),
             )
+        )
 
     def latest_structure_version(self, source_id: str) -> str | None:
         with self.connect() as con:
@@ -163,63 +188,59 @@ class Spool:
         ids = list(ids)
         if not ids:
             return
-        with self.connect() as con:
-            con.executemany(
-                """
-                UPDATE ws_messages
-                SET uploaded_at = ?, last_upload_error = NULL
-                WHERE message_id = ?
-                """,
-                [(uploaded_at, item_id) for item_id in ids],
-            )
+        self._mark(
+            """
+            UPDATE ws_messages
+            SET uploaded_at = ?, last_upload_error = NULL
+            WHERE message_id = ?
+            """,
+            [(uploaded_at, item_id) for item_id in ids],
+        )
 
     def mark_structures_uploaded(self, ids: Iterable[str], uploaded_at: str) -> None:
         ids = list(ids)
         if not ids:
             return
-        with self.connect() as con:
-            con.executemany(
-                """
-                UPDATE structures
-                SET uploaded_at = ?, last_upload_error = NULL
-                WHERE structure_id = ?
-                """,
-                [(uploaded_at, item_id) for item_id in ids],
-            )
+        self._mark(
+            """
+            UPDATE structures
+            SET uploaded_at = ?, last_upload_error = NULL
+            WHERE structure_id = ?
+            """,
+            [(uploaded_at, item_id) for item_id in ids],
+        )
 
     def mark_message_failure(self, ids: Iterable[str], error: str) -> None:
         ids = list(ids)
         if not ids:
             return
-        with self.connect() as con:
-            con.executemany(
-                """
-                UPDATE ws_messages
-                SET upload_attempts = upload_attempts + 1,
-                    last_upload_error = ?
-                WHERE message_id = ?
-                """,
-                [(error[:2000], item_id) for item_id in ids],
-            )
+        self._mark(
+            """
+            UPDATE ws_messages
+            SET upload_attempts = upload_attempts + 1,
+                last_upload_error = ?
+            WHERE message_id = ?
+            """,
+            [(error[:2000], item_id) for item_id in ids],
+        )
 
     def mark_structure_failure(self, ids: Iterable[str], error: str) -> None:
         ids = list(ids)
         if not ids:
             return
-        with self.connect() as con:
-            con.executemany(
-                """
-                UPDATE structures
-                SET upload_attempts = upload_attempts + 1,
-                    last_upload_error = ?
-                WHERE structure_id = ?
-                """,
-                [(error[:2000], item_id) for item_id in ids],
-            )
+        self._mark(
+            """
+            UPDATE structures
+            SET upload_attempts = upload_attempts + 1,
+                last_upload_error = ?
+            WHERE structure_id = ?
+            """,
+            [(error[:2000], item_id) for item_id in ids],
+        )
 
     def prune_uploaded(self, retention_days: int) -> None:
         modifier = f"-{int(retention_days)} days"
-        with self.connect() as con:
+        def prune(con):
             con.execute(
                 """
                 DELETE FROM ws_messages
@@ -236,6 +257,8 @@ class Spool:
                 """,
                 (modifier,),
             )
+
+        self._write(prune)
 
     def status(self) -> dict:
         with self.connect() as con:
