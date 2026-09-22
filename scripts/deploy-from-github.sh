@@ -59,6 +59,8 @@ sync_app() {
     --exclude='*.pyc' \
     --exclude='build/' \
     "$repo/" "$app_dir/"
+  # rsync excludes build; remove stale generated code on deploy AND rollback.
+  rm -rf "$app_dir/build"
 }
 
 install_units() {
@@ -118,6 +120,10 @@ sync_app
 "$venv/bin/pip" install --no-deps --force-reinstall "$app_dir"
 install_units
 systemctl daemon-reload
+# Build a newly introduced status index once while the collector is stopped.
+# Later status/upload calls only use the existing index.
+runuser -u loxonebronze -- "$venv/bin/python" -c \
+  'from loxone_bronze.spool import Spool; Spool("/var/lib/loxone-bronze/spool.sqlite3")'
 systemctl restart "$collector"
 
 if "$timer_was_active"; then

@@ -137,3 +137,24 @@ Silver should later:
 Python **3.10+** is intentionally required. The collector pins `loxwebsocket 0.6.0`
 because that release safely routes request/response commands while the background
 WebSocket listener is active. Older releases are not used as a fallback.
+
+## Uploader throughput and backlog recovery
+
+The uploader drains up to **12 batches of 5,000 messages per five-minute run**, with
+an overall **240-second soft deadline**. It bulk-loads a local JSONL relation with
+one `INSERT OR IGNORE ... SELECT` per batch, then acknowledges that batch in one
+SQLite transaction. No additional dependency or remote per-row staging is needed.
+A failed batch remains retryable; earlier acknowledgements survive.
+
+**Existing Raspberry installations must explicitly update `motherduck.env`.**
+Neither example files nor the deploy drop-in override an existing
+`UPLOAD_BATCH_SIZE=1000` in that file. Startup `upload_config` logs show effective
+safe values. Structured `upload_summary` logs show pending counts, age, throughput
+and the stop reason. Health checks separately report stale collection and backlog;
+count and age thresholds are configurable.
+
+See [Uploader operations](docs/uploader-operations.md) for the exact secret-safe
+one-time update, deployment bridge update, verification commands, read-only
+MotherDuck SQL and measured-rate ETA calculation. For 430,000 pending messages and
+323,000 arrivals/day, twelve-hour recovery requires **at least 13.7 uploads/s over
+wall time**, including timer pauses. This must be verified on the Raspberry.

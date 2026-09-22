@@ -82,6 +82,58 @@ class SpoolTests(unittest.TestCase):
             "second",
         )
 
+    def test_mark_uses_one_write_for_more_than_250_ids(self):
+        from unittest.mock import patch
+        ids = [f"message-{i}" for i in range(501)]
+        for item in ids:
+            self.insert_message(item)
+        with patch.object(self.spool, "_write", wraps=self.spool._write) as write:
+            self.spool.mark_messages_uploaded(ids, "2026-09-22T00:00:00+00:00")
+        self.assertEqual(write.call_count, 1)
+        self.assertEqual(self.spool.status()["messages"]["pending"], 0)
+
+    def test_mark_rolls_back_all_chunks_on_failure(self):
+        from unittest.mock import patch
+        for i in range(501):
+            self.insert_message(str(i))
+        with self.spool.connect() as con:
+            con.execute("CREATE TRIGGER fail_mark BEFORE UPDATE ON ws_messages "
+                        "WHEN NEW.message_id = '300' BEGIN SELECT RAISE(ABORT, 'test failure'); END")
+        import sqlite3
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.spool.mark_messages_uploaded([str(i) for i in range(501)], "2026-09-22T00:00:00+00:00")
+        self.assertEqual(self.spool.status()["messages"]["pending"], 501)
+
+    def test_status_queries_use_indexes(self):
+        with self.spool.connect() as con:
+            for sql, index in (
+                ("SELECT COUNT(*) FROM ws_messages WHERE uploaded_at IS NULL", "ix_ws_messages_pending"),
+                ("SELECT received_at FROM ws_messages WHERE uploaded_at IS NULL ORDER BY received_at LIMIT 1", "ix_ws_messages_pending"),
+                ("SELECT MAX(received_at) FROM ws_messages", "ix_ws_messages_received"),
+            ):
+                plan = str([tuple(row) for row in con.execute("EXPLAIN QUERY PLAN " + sql)])
+                self.assertIn(index, plan)
+        status = self.spool.status(include_totals=False)
+        self.assertNotIn("total", status["messages"])
+        self.assertEqual(status["messages"]["pending"], 0)
+
+    def test_pruning_is_bounded_and_keeps_pending(self):
+        for i in range(6):
+            self.insert_message(str(i))
+        self.spool.mark_messages_uploaded([str(i) for i in range(5)], "2020-01-01T00:00:00+00:00")
+        self.spool.prune_uploaded(7, limit=2)
+        status = self.spool.status()["messages"]
+        self.assertEqual((status["total"], status["pending"]), (4, 1))
+
+    def test_retry_writer_contention(self):
+        import sqlite3
+        from unittest.mock import patch
+        with patch.object(self.spool, "connect", side_effect=[sqlite3.OperationalError("database is locked"), self.spool.connect()]):
+            with patch("loxone_bronze.spool.time.sleep") as sleep:
+                self.insert_message("retried")
+        sleep.assert_called_once()
+        self.assertEqual(self.spool.status()["messages"]["pending"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()
