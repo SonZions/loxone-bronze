@@ -1,7 +1,0 @@
-Metadata-Version: 2.4
-Name: loxone-bronze
-Version: 0.1.0
-Summary: Durable Loxone WebSocket event collector with local SQLite spool and MotherDuck Bronze uploader
-Requires-Python: >=3.10
-Requires-Dist: duckdb<2,>=1.4
-Requires-Dist: loxwebsocket==0.6.0

@@ -1,2 +1,0 @@
-duckdb<2,>=1.4
-loxwebsocket==0.6.0
