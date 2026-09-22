@@ -35,5 +35,14 @@ jobs:
           echo "Approved commit: $GITHUB_SHA"
           echo "The deployment bridge accepts only this exact origin/main commit."
 
+      - name: Require migration-aware deployment bridge
+        run: |
+          if ! bridge_version="$(/usr/local/sbin/loxone-bronze-deploy --version)" || \
+             [[ "$bridge_version" != "loxone-bronze-deploy-v2" ]]; then
+            echo "Update /usr/local/sbin/loxone-bronze-deploy from the reviewed main revision first."
+            echo "No deployment was started. See docs/uploader-operations.md."
+            exit 1
+          fi
+
       - name: Deploy through the restricted bridge
         run: sudo -n /usr/local/sbin/loxone-bronze-deploy "$GITHUB_SHA"
