@@ -54,26 +54,39 @@ ON structures(uploaded_at, captured_at);
 
 
 class Spool:
-    def __init__(self, path: str):
+    def __init__(self, path: str, *, read_only: bool = False):
         self.path = Path(path)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._write(lambda con: con.executescript(SCHEMA))
+        self.read_only = read_only
+        if not read_only:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self._write(lambda con: con.executescript(SCHEMA))
 
     @contextmanager
     def connect(self):
-        con = sqlite3.connect(self.path, timeout=10)
+        if self.read_only:
+            # mode=ro never creates a missing database. Do not use immutable=1:
+            # health must observe committed WAL data from the live collector.
+            con = sqlite3.connect(
+                self.path.resolve().as_uri() + "?mode=ro", uri=True, timeout=2,
+            )
+        else:
+            con = sqlite3.connect(self.path, timeout=10)
         con.row_factory = sqlite3.Row
         try:
-            con.execute("PRAGMA busy_timeout=10000")
-            con.execute("PRAGMA foreign_keys=ON")
-            con.execute("PRAGMA synchronous=NORMAL")
+            if not self.read_only:
+                con.execute("PRAGMA busy_timeout=10000")
+                con.execute("PRAGMA foreign_keys=ON")
+                con.execute("PRAGMA synchronous=NORMAL")
             yield con
-            con.commit()
+            if not self.read_only:
+                con.commit()
         finally:
             con.close()
 
     def _write(self, operation):
         """Run one SQLite write and retry temporary writer contention."""
+        if self.read_only:
+            raise sqlite3.OperationalError("read-only spool does not permit writes")
         for attempt in range(6):
             try:
                 with self.connect() as con:

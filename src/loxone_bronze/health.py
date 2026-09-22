@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import sys
 from datetime import datetime, timezone
 
@@ -61,8 +62,16 @@ def health_problems(status: dict, now: datetime | None = None) -> list[str]:
 
 
 def main() -> None:
-    spool = Spool(os.environ.get("SPOOL_DB", "/var/lib/loxone-bronze/spool.sqlite3"))
-    status = spool.status(include_totals=False)
+    try:
+        spool = Spool(
+            os.environ.get("SPOOL_DB", "/var/lib/loxone-bronze/spool.sqlite3"),
+            read_only=True,
+        )
+        status = spool.status(include_totals=False)
+    except (sqlite3.Error, OSError) as exc:
+        # Do not expose paths, driver details or a traceback in operational logs.
+        print(f"UNHEALTHY: spool_unavailable ({type(exc).__name__})", file=sys.stderr)
+        raise SystemExit(1) from None
     print(json.dumps(status, indent=2, ensure_ascii=False))
     try:
         problems = health_problems(status)
