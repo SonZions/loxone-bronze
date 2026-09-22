@@ -52,7 +52,10 @@ cp "${APP_DIR}/app/systemd/"*.timer /etc/systemd/system/
 systemctl daemon-reload
 
 echo
-echo "Installed."
+echo "Installed. Existing environment files and secrets were preserved."
+echo "Existing installations: explicitly set UPLOAD_BATCH_SIZE=5000,"
+echo "UPLOAD_MAX_BATCHES_PER_RUN=12 and UPLOAD_MAX_RUNTIME_SECONDS=240."
+echo "See docs/uploader-operations.md; example files are NOT applied to existing env files."
 echo "Now edit:"
 echo "  ${ETC_DIR}/collector.env"
 echo "  ${ETC_DIR}/motherduck.env"

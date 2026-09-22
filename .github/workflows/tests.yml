@@ -1,0 +1,23 @@
+name: Tests
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ['3.10', '3.11']
+        duckdb: ['1.4.0', 'latest']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: python -m pip install .
+      - if: matrix.duckdb != 'latest'
+        run: python -m pip install 'duckdb==${{ matrix.duckdb }}'
+      - run: python -m unittest discover -s tests -v
+      - run: bash -n scripts/*.sh

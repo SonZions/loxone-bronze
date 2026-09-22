@@ -5,6 +5,9 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
+# Hard recovery bound for a stuck network call; unfinished batches retry safely.
+TimeoutStartSec=270
+TimeoutStopSec=15
 User=loxonebronze
 Group=loxonebronze
 EnvironmentFile=/etc/loxone-bronze/motherduck.env

@@ -3,6 +3,7 @@ from __future__ import annotations
 import sqlite3
 import time
 from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterable
 
@@ -29,6 +30,10 @@ CREATE TABLE IF NOT EXISTS ws_messages (
 
 CREATE INDEX IF NOT EXISTS ix_ws_messages_pending
 ON ws_messages(uploaded_at, received_at);
+
+-- The pending index cannot efficiently answer MAX(received_at) globally.
+CREATE INDEX IF NOT EXISTS ix_ws_messages_received
+ON ws_messages(received_at);
 
 CREATE TABLE IF NOT EXISTS structures (
     structure_id TEXT PRIMARY KEY,
@@ -82,11 +87,12 @@ class Spool:
                 time.sleep(0.25 * (attempt + 1))
 
     def _mark(self, statement: str, rows) -> None:
-        for start in range(0, len(rows), 250):
-            batch = rows[start:start + 250]
-            self._write(
-                lambda con, batch=batch: con.executemany(statement, batch)
-            )
+        if not rows:
+            return
+        def mark(con):
+            for start in range(0, len(rows), 250):
+                con.executemany(statement, rows[start:start + 250])
+        self._write(mark)
 
     def insert_message(
         self,
@@ -238,52 +244,41 @@ class Spool:
             [(error[:2000], item_id) for item_id in ids],
         )
 
-    def prune_uploaded(self, retention_days: int) -> None:
-        modifier = f"-{int(retention_days)} days"
-        def prune(con):
-            con.execute(
-                """
-                DELETE FROM ws_messages
-                WHERE uploaded_at IS NOT NULL
-                  AND datetime(uploaded_at) < datetime('now', ?)
-                """,
-                (modifier,),
-            )
-            con.execute(
-                """
-                DELETE FROM structures
-                WHERE uploaded_at IS NOT NULL
-                  AND datetime(uploaded_at) < datetime('now', ?)
-                """,
-                (modifier,),
-            )
+    def prune_uploaded(self, retention_days: int, limit: int = 5000) -> None:
+        # uploaded_at is always UTC ISO text emitted by this application. Use the
+        # existing index and bound deletions so retention cannot monopolize WAL.
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=retention_days)).isoformat(
+            timespec="microseconds"
+        )
+        for table in ("ws_messages", "structures"):
+            self._write(lambda con, table=table: con.execute(
+                f"DELETE FROM {table} WHERE rowid IN ("
+                f"SELECT rowid FROM {table} WHERE uploaded_at < ? "
+                "ORDER BY uploaded_at LIMIT ?)", (cutoff, limit),
+            ))
 
-        self._write(prune)
-
-    def status(self) -> dict:
+    def status(self, include_totals: bool = True) -> dict:
+        result = {"path": str(self.path)}
         with self.connect() as con:
-            msg = con.execute(
-                """
-                SELECT
-                    COUNT(*) AS total,
-                    SUM(CASE WHEN uploaded_at IS NULL THEN 1 ELSE 0 END) AS pending,
-                    MIN(CASE WHEN uploaded_at IS NULL THEN received_at END) AS oldest_pending,
-                    MAX(received_at) AS latest
-                FROM ws_messages
-                """
-            ).fetchone()
-            structures = con.execute(
-                """
-                SELECT
-                    COUNT(*) AS total,
-                    SUM(CASE WHEN uploaded_at IS NULL THEN 1 ELSE 0 END) AS pending,
-                    MAX(captured_at) AS latest
-                FROM structures
-                """
-            ).fetchone()
-
-        return {
-            "messages": dict(msg),
-            "structures": dict(structures),
-            "path": str(self.path),
-        }
+            # One WAL read snapshot; no writer lock. Runtime/health skip totals.
+            con.execute("BEGIN")
+            for key, table, timestamp in (
+                ("messages", "ws_messages", "received_at"),
+                ("structures", "structures", "captured_at"),
+            ):
+                pending = con.execute(
+                    f"SELECT COUNT(*) FROM {table} WHERE uploaded_at IS NULL"
+                ).fetchone()[0]
+                oldest = con.execute(
+                    f"SELECT {timestamp} FROM {table} WHERE uploaded_at IS NULL "
+                    f"ORDER BY {timestamp} LIMIT 1"
+                ).fetchone()
+                latest = con.execute(f"SELECT MAX({timestamp}) FROM {table}").fetchone()[0]
+                result[key] = {
+                    "pending": pending,
+                    "oldest_pending": oldest[0] if oldest else None,
+                    "latest": latest,
+                }
+                if include_totals:
+                    result[key]["total"] = con.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        return result
