@@ -132,6 +132,30 @@ health failure is expected and does not prove the collector is broken.
 
 ## Deployment
 
+### Recovery from the locked-healthcheck deployment failure
+
+Health now opens an existing spool with SQLite `mode=ro`, without running schema
+DDL, setting journal mode or creating missing files/directories. It can read the
+last committed WAL snapshot while another connection holds a write transaction,
+including on an older spool without the latest-event index. A missing/unreadable
+spool or schema reports `spool_unavailable` and exits nonzero without a traceback.
+Do not use `immutable=1` for this live database: committed WAL updates must remain
+visible. Read-only refers to database contents; SQLite may still use WAL/SHM
+coordination files. The service account already owns the spool directory.
+
+Before redeploying, merge this correction and refresh the separately installed
+bridge using the commands in step 4 below. Confirm:
+
+```bash
+/usr/local/sbin/loxone-bronze-deploy --version
+```
+
+Expected: `loxone-bronze-deploy-v2`. The workflow now refuses an old bridge before
+stopping any services. It does not grant the runner extra sudo rights or replace
+the root-owned bridge automatically. The bridge stops all writers, performs the
+schema migration, starts the collector, checks its health, and only then resumes
+the upload timer. Existing environment files/secrets remain untouched.
+
 1. Review/merge the PR into `main`. The change does not deploy merely by pushing.
    The workflow is still manual, with the existing production environment gate.
 2. Apply the three production parameters above. Do not display environment files.

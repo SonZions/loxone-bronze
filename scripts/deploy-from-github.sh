@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
+# Read-only capability check, usable by the runner without additional sudo rights.
+if [[ "${1:-}" == "--version" ]]; then
+  echo "loxone-bronze-deploy-v2"
+  exit 0
+fi
+
 if [[ "${EUID}" -ne 0 ]]; then
   echo "Run as root." >&2
   exit 1
@@ -112,7 +118,7 @@ fi
 echo "Deploying Loxone Bronze commit $expected_sha"
 echo "Rollback target is $previous_sha"
 systemctl stop "$timer"
-systemctl stop "$uploader" || true
+systemctl stop "$uploader"
 systemctl stop "$collector"
 
 runuser -u "$repo_user" -- git -C "$repo" reset --hard "$expected_sha"
@@ -122,19 +128,13 @@ install_units
 systemctl daemon-reload
 # Build a newly introduced status index once while the collector is stopped.
 # Later status/upload calls only use the existing index.
+echo "Migrating spool schema with collector, uploader and timer stopped."
 runuser -u loxonebronze -- "$venv/bin/python" -c \
   'from loxone_bronze.spool import Spool; Spool("/var/lib/loxone-bronze/spool.sqlite3")'
 systemctl restart "$collector"
 
-if "$timer_was_active"; then
-  systemctl start "$timer"
-fi
-
 sleep 5
 systemctl is-active --quiet "$collector"
-if "$timer_was_active"; then
-  systemctl is-active --quiet "$timer"
-fi
 
 # A running process is not enough: after reconnect the collector must write fresh
 # data to the spool. Historical uploader backlog is deliberately excluded here;
@@ -145,6 +145,12 @@ runuser -u loxonebronze -- env \
   HEALTH_MAX_EVENT_AGE_MINUTES=2 \
   HEALTH_CHECK_BACKLOG=false \
   "$venv/bin/loxone-bronze-health"
+
+# Resume uploads only after the collector passes its read-only health check.
+if "$timer_was_active"; then
+  systemctl start "$timer"
+  systemctl is-active --quiet "$timer"
+fi
 
 install -d -m 0755 "$state_dir"
 printf '%s\n' "$expected_sha" > "$last_good_file"
