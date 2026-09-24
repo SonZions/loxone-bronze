@@ -16,6 +16,10 @@ dependencies = [
 loxone-bronze-collector = "loxone_bronze.collector:main"
 loxone-bronze-uploader = "loxone_bronze.uploader:main"
 loxone-bronze-health = "loxone_bronze.health:main"
+loxone-silver-refresh = "loxone_bronze.silver:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+loxone_bronze = ["silver_sql/*.sql"]
