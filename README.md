@@ -167,5 +167,9 @@ tables remain in MotherDuck; the Pi stores only code, credentials and logs.
 It reads `loxone_ingest.loxone_bronze` and updates `my_db.loxone_silver` in bounded,
 atomic batches, including late uploads and temporal remapping after new structures.
 It uses its own service account, pinned Python environment and 15-minute timer.
-Installation does not start the timer or modify Bronze services.
+The existing **Deploy Loxone Bronze + Silver** action installs both components
+after a one-time administrator upgrade of the restricted bridge to v3.
+First Silver installation leaves its timer stopped for token setup and validation;
+later deployments resume a previously active Silver timer. Silver activation failure
+restores Silver without undoing a successful Bronze deployment.
 See [Silver operations](docs/silver-operations.md) for installation and cutover.

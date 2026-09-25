@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
-# Separate from Bronze's restricted deploy bridge; run as a trusted administrator.
+# Called by the restricted deploy bridge, or directly by a trusted administrator.
 set -Eeuo pipefail
 [[ "$EUID" -eq 0 ]] || { echo 'Run as root.' >&2; exit 1; }
 expected_sha="${1:-}"
 [[ "$expected_sha" =~ ^[0-9a-f]{40}$ ]] || { echo 'Usage: install-silver.sh <reviewed main SHA>' >&2; exit 2; }
-repo="$(cd -- "$(dirname -- "$0")/.." && pwd)"
+mode="${2:---pause}"
+[[ "$mode" == --pause || "$mode" == --resume ]] || { echo 'Expected --pause or --resume.' >&2; exit 2; }
+repo="${3:-$(cd -- "$(dirname -- "$0")/.." && pwd)}"
 # Git is run as the owner, without changing global safe.directory configuration.
 repo_owner="$(stat -c %U "$repo")"
 repo_git() { runuser -u "$repo_owner" -- git -C "$repo" "$@"; }
@@ -33,9 +35,65 @@ python3 -m venv "$release/venv"
 if [[ ! -e /etc/loxone-silver/silver.env ]]; then
   install -o root -g root -m 0600 "$release/app/config/silver.env.example" /etc/loxone-silver/silver.env
 fi
-# Installation never starts cloud writes. Pause scheduling and let an active run
+# First installation never starts cloud writes. Pause scheduling and let an active run
 # finish before changing the symlink. Its systemd timeout provides a hard bound.
-systemctl stop loxone-silver-refresh.timer 2>/dev/null || true
+timer=loxone-silver-refresh.timer
+timer_was_active=false
+if systemctl is-active --quiet "$timer"; then
+  timer_was_active=true
+fi
+previous=""
+if [[ -L "$base/current" ]]; then
+  previous="$(readlink -f "$base/current")"
+fi
+# Preserve the actual installed units, including any admin edits, for rollback.
+backup="$release/rollback-units"
+install -d -m 0700 "$backup"
+for unit in loxone-silver-refresh.service loxone-silver-refresh.timer; do
+  if [[ -e "/etc/systemd/system/$unit" ]]; then
+    cp -a "/etc/systemd/system/$unit" "$backup/$unit"
+  fi
+done
+activation_started=false
+restore_silver() {
+  local code="$1"
+  trap - EXIT INT TERM
+  [[ "$code" -eq 0 ]] && return
+  set +e
+  echo 'Silver installation failed; restoring its previous activation.' >&2
+  systemctl stop "$timer"
+  if "$activation_started"; then
+    # A resumed timer may already have scheduled a refresh. Stop it before
+    # restoring code; Silver's cloud transactions make interruption retry-safe.
+    systemctl stop loxone-silver-refresh.service
+    if [[ -n "$previous" ]]; then
+      ln -sfn "$previous" "$base/.current-rollback"
+      mv -Tf "$base/.current-rollback" "$base/current"
+    else
+      # Only the symlink created by this first activation; retain release files.
+      [[ -L "$base/current" ]] && unlink "$base/current"
+    fi
+    for unit in loxone-silver-refresh.service loxone-silver-refresh.timer; do
+      if [[ -e "$backup/$unit" ]]; then
+        cp -a "$backup/$unit" "/etc/systemd/system/$unit"
+      else
+        [[ -f "/etc/systemd/system/$unit" ]] && unlink "/etc/systemd/system/$unit"
+      fi
+    done
+    systemctl daemon-reload
+  fi
+  if "$timer_was_active"; then
+    systemctl start "$timer" || echo 'ERROR: previous Silver timer could not be resumed.' >&2
+  fi
+  exit "$code"
+}
+trap 'exit 130' INT
+trap 'exit 143' TERM
+# EXIT also handles errexit and handled termination signals; SIGKILL cannot recover.
+trap 'restore_silver "$?"' EXIT
+if systemctl cat "$timer" >/dev/null 2>&1; then
+  systemctl stop "$timer"
+fi
 while true; do
   silver_state="$(systemctl show loxone-silver-refresh.service -p ActiveState --value 2>/dev/null || true)"
   case "$silver_state" in
@@ -43,15 +101,22 @@ while true; do
     *) break ;;
   esac
 done
-if [[ -L "$base/current" ]]; then
-  previous="$(readlink -f "$base/current")"
+if [[ -n "$previous" ]]; then
   ln -sfn "$previous" "$base/previous"
 fi
+activation_started=true
 ln -sfn "$release" "$base/.current-new"
 mv -Tf "$base/.current-new" "$base/current"
 install -o root -g root -m 0644 "$release/app/systemd/loxone-silver-refresh.service" /etc/systemd/system/
 install -o root -g root -m 0644 "$release/app/systemd/loxone-silver-refresh.timer" /etc/systemd/system/
 systemctl daemon-reload
-printf 'Installed Silver revision %s. Timer is stopped.\n' "$expected_sha"
-echo 'Set the token with sudoedit /etc/loxone-silver/silver.env.'
-echo 'Then follow docs/silver-operations.md for the read-only check, first run and timer.'
+runuser -u loxonesilver -- "$release/venv/bin/python" -c 'from loxone_bronze.silver import SilverConfig; SilverConfig().sql("batch.sql")'
+if [[ "$mode" == --resume ]] && "$timer_was_active"; then
+  systemctl start "$timer"
+  systemctl is-active --quiet "$timer"
+  echo 'Previously active Silver timer resumed. No forced refresh was triggered.'
+else
+  echo 'Silver timer remains stopped. Configure the token and verify the first run before enabling.'
+fi
+trap - ERR INT TERM EXIT
+printf 'Installed Silver revision %s.\n' "$expected_sha"
