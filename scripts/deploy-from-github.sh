@@ -3,7 +3,7 @@ set -Eeuo pipefail
 
 # Read-only capability check, usable by the runner without additional sudo rights.
 if [[ "${1:-}" == "--version" ]]; then
-  echo "loxone-bronze-deploy-v2"
+  echo "loxone-bronze-deploy-v3"
   exit 0
 fi
 
@@ -158,3 +158,10 @@ chmod 0644 "$last_good_file"
 
 trap - ERR
 echo "Deployment completed and passed post-deploy health check: $expected_sha"
+
+# Silver is an independent release. A Silver failure must not roll back healthy
+# Bronze or restart its collector again. The installer restores Silver itself.
+# Use the root-owned deployed script, not executable code in the user-owned repo.
+echo "Installing Silver for the same approved revision."
+bash "$app_dir/scripts/install-silver.sh" "$expected_sha" --resume "$repo"
+echo "Bronze and Silver deployment completed: $expected_sha"

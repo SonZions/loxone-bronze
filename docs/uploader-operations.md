@@ -150,7 +150,7 @@ bridge using the commands in step 4 below. Confirm:
 /usr/local/sbin/loxone-bronze-deploy --version
 ```
 
-Expected: `loxone-bronze-deploy-v2`. The workflow now refuses an old bridge before
+Expected: `loxone-bronze-deploy-v3`. The workflow now refuses an old bridge before
 stopping any services. It does not grant the runner extra sudo rights or replace
 the root-owned bridge automatically. The bridge stops all writers, performs the
 schema migration, starts the collector, checks its health, and only then resumes
@@ -181,7 +181,7 @@ the upload timer. Existing environment files/secrets remain untouched.
 
    A trusted admin should run this after reviewing the merged revision. The bridge
    still refuses anything other than the exact approved `origin/main` SHA. The
-   workflow timeout remains ten minutes; a very large first index build may need
+   workflow timeout is thirty minutes, including the separate Silver phase; a very large first index build may need
    a longer planned maintenance window. `install.sh` is for initial installation;
    do not run it over a live deployment instead of the controlled bridge.
 5. Enable the timer if it was previously disabled, and trigger one run:
