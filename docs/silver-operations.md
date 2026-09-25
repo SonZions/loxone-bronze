@@ -60,12 +60,60 @@ No production data was changed while preparing this implementation.
   Do not clear the ledger alone unless a full replay is intended.
 - Unsupported/unparsed/empty messages stay in Bronze and create no Silver events.
 
-## Install after reviewing and merging the PR
+## Recommended: existing GitHub deployment action
+
+The **Deploy Loxone Bronze + Silver** action now deploys both components from
+the exact approved `main` SHA. It is still manually dispatched and retains the
+`loxberry-production` environment gate and the existing restricted sudo command.
+Merge alone does not deploy. Do not run a separate manual Git update/installer
+alongside the action.
+
+### One-time bridge upgrade (trusted administrator)
+
+After reviewing and merging the deployment integration, update the separately
+installed root-owned bridge. The runner cannot upgrade its own privileged bridge.
+Use these commands on the Pi; they fetch code but do not restart services:
+
+```bash
+sudo -u loxberry git -C /srv/raspi-data/repos/loxone-bronze fetch origin main
+silver_bridge_review="$(mktemp -d)"
+sudo -u loxberry git -C /srv/raspi-data/repos/loxone-bronze show origin/main:scripts/deploy-from-github.sh > "$silver_bridge_review/deploy.sh"
+less "$silver_bridge_review/deploy.sh"
+sudo install -o root -g root -m 0755 "$silver_bridge_review/deploy.sh" /usr/local/sbin/loxone-bronze-deploy
+/usr/local/sbin/loxone-bronze-deploy --version
+```
+
+Expected: `loxone-bronze-deploy-v3`. No sudoers change is required. Old bridges
+are rejected by the workflow before stopping services. Then select **Run workflow**
+on `main` for **Deploy Loxone Bronze + Silver** and approve the environment gate.
+
+The bridge completes Bronze's health check and records its successful revision,
+then calls the root-owned deployed Silver installer with `--resume` and the same
+SHA. Silver is prepared in a separate environment while existing services continue.
+During activation it pauses only Silver's timer and drains its active refresh.
+First installation leaves Silver stopped even if a token is already configured.
+An upgrade resumes a previously active timer; stopped timers remain stopped and
+the enabled/disabled boot state is not changed. Resuming a timer may naturally
+schedule a run immediately; the installer does not explicitly request a refresh.
+
+If Silver fails, the action is red, but healthy Bronze remains deployed. Activation
+failures restore Silver's previous code symlink, actual unit files, and previously
+active timer. First-activation failure removes only the newly installed units and
+current symlink, retaining release files. Existing env files are never overwritten.
+SIGKILL/power loss cannot execute shell rollback; verify the current symlink/units
+and rerun the reviewed installer after such an interruption. The workflow allows
+30 minutes for dependency installation, service draining and both deployment phases.
+
+After the first successful action, continue with **Token and cutover** below.
+After that, normal code updates require only the same action. Changes to the
+privileged bridge itself still require explicit administrator review/installation.
+
+## Alternative: manual Silver installation
 
 A trusted Raspberry administrator performs the first installation. This uses a
 separate account (`loxonesilver`) and environment, preserving Bronze and its
-restricted GitHub deployment bridge. The existing Bronze workflow does not install
-Silver. No additional runner sudo permissions are needed or added.
+restricted GitHub deployment bridge. Use this alternative only when not deploying
+via the action above. No additional runner sudo permissions are needed or added.
 
 ```bash
 sudo -u loxberry git -C /srv/raspi-data/repos/loxone-bronze fetch origin main
