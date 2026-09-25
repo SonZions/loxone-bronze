@@ -1,0 +1,25 @@
+[Unit]
+Description=Loxone Silver refresh (Raspberry orchestration, MotherDuck storage and SQL)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=loxonesilver
+Group=loxonesilver
+EnvironmentFile=/etc/loxone-silver/silver.env
+ExecStart=/opt/loxone-silver/current/venv/bin/loxone-silver-refresh
+TimeoutStartSec=720
+TimeoutStopSec=15
+Nice=10
+MemoryMax=512M
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ReadWritePaths=/var/lib/loxone-silver

@@ -9,6 +9,7 @@ description = "Durable Loxone WebSocket event collector with local SQLite spool 
 requires-python = ">=3.10"
 dependencies = [
   "duckdb>=1.4,<2",
+  "pytz==2025.2",
   "loxwebsocket==0.6.0",
 ]
 
@@ -16,6 +17,10 @@ dependencies = [
 loxone-bronze-collector = "loxone_bronze.collector:main"
 loxone-bronze-uploader = "loxone_bronze.uploader:main"
 loxone-bronze-health = "loxone_bronze.health:main"
+loxone-silver-refresh = "loxone_bronze.silver:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+loxone_bronze = ["silver_sql/*.sql"]

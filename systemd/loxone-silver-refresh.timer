@@ -1,0 +1,11 @@
+[Unit]
+Description=Refresh Loxone Silver every 15 minutes
+
+[Timer]
+OnBootSec=5min
+OnUnitInactiveSec=15min
+AccuracySec=30s
+Unit=loxone-silver-refresh.service
+
+[Install]
+WantedBy=timers.target
