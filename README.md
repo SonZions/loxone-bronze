@@ -158,3 +158,14 @@ one-time update, deployment bridge update, verification commands, read-only
 MotherDuck SQL and measured-rate ETA calculation. For 430,000 pending messages and
 323,000 arrivals/day, twelve-hour recovery requires **at least 13.7 uploads/s over
 wall time**, including timer pauses. This must be verified on the Raspberry.
+
+## Raspberry Silver refresh
+
+The optional `loxone-silver-refresh` job replaces the former Silver Flight's
+scheduling and Python client. Bronze, Silver, the processing ledger, and SQL work
+tables remain in MotherDuck; the Pi stores only code, credentials and logs.
+It reads `loxone_ingest.loxone_bronze` and updates `my_db.loxone_silver` in bounded,
+atomic batches, including late uploads and temporal remapping after new structures.
+It uses its own service account, pinned Python environment and 15-minute timer.
+Installation does not start the timer or modify Bronze services.
+See [Silver operations](docs/silver-operations.md) for installation and cutover.
