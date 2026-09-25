@@ -121,7 +121,7 @@ class DeployContractTests(unittest.TestCase):
         result = subprocess.run(["bash", "scripts/deploy-from-github.sh", "--version"],
                                 capture_output=True, text=True, timeout=3)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.strip(), "loxone-bronze-deploy-v2")
+        self.assertEqual(result.stdout.strip(), "loxone-bronze-deploy-v3")
 
     def test_deploy_order_and_workflow_preflight(self):
         script = Path("scripts/deploy-from-github.sh").read_text()
@@ -136,4 +136,4 @@ class DeployContractTests(unittest.TestCase):
                          [stop, migrate, restart, health, timer])
         workflow = Path(".github/workflows/deploy.yml").read_text()
         self.assertLess(workflow.index("--version"), workflow.index("sudo -n"))
-        self.assertIn("loxone-bronze-deploy-v2", workflow)
+        self.assertIn("loxone-bronze-deploy-v3", workflow)

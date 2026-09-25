@@ -1,4 +1,4 @@
-name: Deploy Loxone Bronze
+name: Deploy Loxone Bronze + Silver
 
 on:
   workflow_dispatch:
@@ -27,7 +27,7 @@ jobs:
     runs-on: [self-hosted, Linux, ARM64]
     environment:
       name: loxberry-production
-    timeout-minutes: 10
+    timeout-minutes: 30
 
     steps:
       - name: Show approved revision
@@ -38,9 +38,9 @@ jobs:
       - name: Require migration-aware deployment bridge
         run: |
           if ! bridge_version="$(/usr/local/sbin/loxone-bronze-deploy --version)" || \
-             [[ "$bridge_version" != "loxone-bronze-deploy-v2" ]]; then
+             [[ "$bridge_version" != "loxone-bronze-deploy-v3" ]]; then
             echo "Update /usr/local/sbin/loxone-bronze-deploy from the reviewed main revision first."
-            echo "No deployment was started. See docs/uploader-operations.md."
+            echo "No deployment was started. See docs/silver-operations.md."
             exit 1
           fi
 
