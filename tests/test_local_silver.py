@@ -110,6 +110,23 @@ class LocalSilverTests(unittest.TestCase):
             sync_local_structure(c,sc,enqueue_remapping)
             self.assertEqual(c.execute(query).fetchall(),expected)
         finally:c.close()
+    def test_failed_export_rolls_back_and_retry_has_no_duplicate(self):
+        self.structure();self.message()
+        with patch('loxone_bronze.local_silver.sha256',side_effect=OSError('simulated export failure')):
+            with self.assertRaises(OSError):run(self.cfg)
+        with duckdb.connect(self.cfg.database) as c:
+            self.assertEqual(c.execute('SELECT count(*) FROM loxone_silver.state_events').fetchone()[0],0)
+            self.assertEqual(c.execute('SELECT count(*) FROM process_queue').fetchone()[0],1)
+        self.assertFalse(list(Path(self.cfg.outbox).glob('*/manifest.json')))
+        run(self.cfg)
+        with duckdb.connect(self.cfg.database) as c:
+            self.assertEqual(c.execute('SELECT count(*) FROM loxone_silver.state_events').fetchone()[0],1)
+    def test_missing_manifest_is_recovered_from_committed_queue(self):
+        self.message();run(self.cfg)
+        manifest=next(Path(self.cfg.outbox).glob('*/manifest.json'));manifest.unlink()
+        run(self.cfg)
+        self.assertTrue(manifest.exists())
+        validate_batch(manifest.parent)
     def test_corrupt_transport_copy_is_rejected(self):
         self.message();run(self.cfg)
         path=next(Path(self.cfg.outbox).glob('*/manifest.json')).parent
