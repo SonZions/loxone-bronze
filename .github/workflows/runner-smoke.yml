@@ -34,4 +34,5 @@ jobs:
       - name: Run spool unit tests
         env:
           PYTHONPATH: src
-        run: python3 -m unittest discover -s tests -v
+        # The host Python intentionally has no application dependencies.
+        run: /opt/loxone-bronze/venv/bin/python -m unittest discover -s tests -v

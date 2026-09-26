@@ -53,6 +53,12 @@ backup/export process. Restoring an archive older than the source acknowledgemen
 fails closed; restore/reconcile it before resuming. Do not remove the retention gate
 just to unblock pruning. Already-pruned historical data is not recoverable locally.
 
+When raw Bronze upload to MotherDuck is intentionally retired, set
+`LOCAL_SILVER_PRUNE_LOCAL_ONLY=1`. The offline worker then prunes only rows older
+than `LOCAL_SILVER_SPOOL_RETENTION_DAYS` whose local archive acknowledgement is
+durable. It does not mark them as cloud-uploaded. Enable this mode before stopping
+`loxone-bronze-uploader.timer`; otherwise the SQLite spool cannot be reclaimed.
+
 An outbox manifest is exposed only after the data/queue transaction commits.
 Crashes before commit may leave an unexposed directory; the next attempt replaces
 that directory. A committed batch missing its manifest is finalized on restart.
