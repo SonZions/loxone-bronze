@@ -31,8 +31,8 @@ jobs:
       - name: Compile source
         run: python3 -m compileall -q src
 
-      - name: Run spool unit tests
+      - name: Import deployed runtime dependencies
         env:
           PYTHONPATH: src
-        # The host Python intentionally has no application dependencies.
-        run: /opt/loxone-bronze/venv/bin/python -m unittest discover -s tests -v
+        # Full tests run on hosted runners; keep the 1 GB production Pi responsive.
+        run: /opt/loxone-bronze/venv/bin/python -c "import duckdb; import loxone_bronze.spool; import loxone_bronze.local_silver"
