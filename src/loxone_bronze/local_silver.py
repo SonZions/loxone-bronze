@@ -117,8 +117,12 @@ def import_spool(c,cfg,table):
             raise RuntimeError('Archive missing or older than acknowledged spool; restore required')
         if ack[0] < cursor:
             src.execute('UPDATE local_silver_checkpoints SET rowid_highwater=? WHERE table_name=?',(cursor,table))
-        rows=src.execute(f'SELECT rowid AS spool_rowid,* FROM {table} WHERE rowid>? ORDER BY rowid LIMIT ?',
-                         (cursor,1 if table=='structures' else cfg.import_size)).fetchall()
+        selected=src.execute(f'SELECT rowid AS spool_rowid,* FROM {table} WHERE rowid>? ORDER BY rowid LIMIT ?',
+                             (cursor,1 if table=='structures' else cfg.import_size))
+        rows=[]; payload_bytes=0
+        for record in selected:
+            rows.append(record); payload_bytes+=len(record['payload_json'].encode())
+            if payload_bytes>=2*1024*1024: break
     if not rows: return 0
     c.execute('BEGIN')
     try:
