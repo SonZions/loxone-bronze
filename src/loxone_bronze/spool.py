@@ -264,11 +264,21 @@ class Spool:
             timespec="microseconds"
         )
         for table in ("ws_messages", "structures"):
-            self._write(lambda con, table=table: con.execute(
+            def prune(con, table=table):
+                guard = ""
+                args = [cutoff, limit]
+                if con.execute("SELECT 1 FROM sqlite_master WHERE name='local_silver_checkpoints'").fetchone():
+                    # Local archival acknowledges only after its DuckDB commit.
+                    # Retain the last row to keep SQLite rowids monotonic.
+                    guard = (" AND rowid <= COALESCE((SELECT rowid_highwater FROM "
+                             "local_silver_checkpoints WHERE table_name=?),0) "
+                             f"AND rowid < (SELECT max(rowid) FROM {table})")
+                    args = [cutoff, table, limit]
+                con.execute(
                 f"DELETE FROM {table} WHERE rowid IN ("
-                f"SELECT rowid FROM {table} WHERE uploaded_at < ? "
-                "ORDER BY uploaded_at LIMIT ?)", (cutoff, limit),
-            ))
+                f"SELECT rowid FROM {table} WHERE uploaded_at < ? {guard} "
+                "ORDER BY uploaded_at LIMIT ?)", args)
+            self._write(prune)
 
     def status(self, include_totals: bool = True) -> dict:
         result = {"path": str(self.path)}
