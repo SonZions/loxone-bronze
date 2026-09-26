@@ -173,3 +173,12 @@ First Silver installation leaves its timer stopped for token setup and validatio
 later deployments resume a previously active Silver timer. Silver activation failure
 restores Silver without undoing a successful Bronze deployment.
 See [Silver operations](docs/silver-operations.md) for installation and cutover.
+
+### Optional local Silver processing
+
+For small-memory Raspberry installations, the opt-in local Silver pipeline reads
+Bronze directly from the local spool, archives it in DuckDB, computes events/current
+state/hourly summaries offline and publishes prepared batches to MotherDuck.
+The existing Bronze uploader remains intact; retention waits for local archival.
+See [local Silver operations](docs/local-silver-operations.md) for limits,
+activation, recovery and the separate cloud-history backfill requirement.

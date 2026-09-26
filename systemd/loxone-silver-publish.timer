@@ -1,0 +1,9 @@
+[Unit]
+Description=Publish prepared Silver results hourly
+[Timer]
+OnBootSec=15min
+OnUnitInactiveSec=1h
+AccuracySec=1min
+Unit=loxone-silver-publish.service
+[Install]
+WantedBy=timers.target

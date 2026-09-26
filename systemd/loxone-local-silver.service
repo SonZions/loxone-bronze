@@ -1,0 +1,26 @@
+[Unit]
+Description=Offline Loxone Silver processing on local disk
+RequiresMountsFor=/srv/raspi-data
+After=loxone-bronze-collector.service
+
+[Service]
+Type=oneshot
+User=loxonebronze
+Group=loxonebronze
+EnvironmentFile=/etc/loxone-silver/local.env
+ExecStart=/opt/loxone-local-silver/current/venv/bin/python -m loxone_bronze.local_silver
+WorkingDirectory=/srv/raspi-data/loxone-silver
+TimeoutStartSec=180
+TimeoutStopSec=15
+Nice=19
+CPUQuota=75%
+MemoryMax=240M
+MemorySwapMax=0
+UMask=0077
+PrivateNetwork=true
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/srv/raspi-data/loxone-silver /var/lib/loxone-bronze /srv/raspi-data/loxone-bronze

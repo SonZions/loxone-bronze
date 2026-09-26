@@ -1,0 +1,9 @@
+[Unit]
+Description=Process local Loxone Silver in bounded batches
+[Timer]
+OnBootSec=5min
+OnUnitInactiveSec=30s
+AccuracySec=10s
+Unit=loxone-local-silver.service
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,27 @@
+[Unit]
+Description=Publish prepared Loxone Silver results to MotherDuck
+RequiresMountsFor=/srv/raspi-data
+After=network-online.target
+Wants=network-online.target
+[Service]
+Type=oneshot
+User=loxonebronze
+Group=loxonebronze
+# Reuse the existing ingest identity; never copy credentials to GitHub.
+EnvironmentFile=/etc/loxone-bronze/motherduck.env
+EnvironmentFile=/etc/loxone-silver/local.env
+ExecStart=/opt/loxone-local-silver/current/venv/bin/python -m loxone_bronze.silver_publish
+WorkingDirectory=/srv/raspi-data/loxone-silver
+TimeoutStartSec=240
+TimeoutStopSec=15
+Nice=19
+CPUQuota=75%
+MemoryMax=240M
+MemorySwapMax=0
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/srv/raspi-data/loxone-silver
