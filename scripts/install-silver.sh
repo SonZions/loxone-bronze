@@ -120,3 +120,8 @@ else
 fi
 trap - ERR INT TERM EXIT
 printf 'Installed Silver revision %s.\n' "$expected_sha"
+
+# Explicit administrator opt-in; existing cloud-only installations stay unchanged.
+if [[ -f /etc/loxone-silver/local.enabled ]]; then
+  bash "$release/app/scripts/install-local-silver.sh" "$release"
+fi
