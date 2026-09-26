@@ -28,6 +28,7 @@ class SilverDeployTests(unittest.TestCase):
         script = Path('scripts/install-silver.sh').read_text()
         tail = script[script.index('# First installation'):]
         tail = tail.replace('/etc/systemd/system', str(units))
+        tail = tail.replace('/etc/loxone-silver/local.enabled', str(root/'local.enabled'))
         # The deployed tail only imports local resources; mock that command here.
         preamble = f'''set -Eeuo pipefail
 base={shlex.quote(str(base))}

@@ -91,7 +91,7 @@ def run(outbox,database='my_db',schema='loxone_silver_local',max_batches=100,max
             if size>=16*1024*1024:break
         if not batches:return {'published':0}
         # Cloud connection exists only in this publisher, never in the local worker.
-        c=(connect or (lambda:duckdb.connect('md:'+database,config={'threads':1,'memory_limit':'96MB'})))()
+        c=(connect or (lambda:duckdb.connect('md:'+database,config={'threads':1,'memory_limit':'96MB','extension_directory':str(root.parent/'extensions')})))()
         try:
             c.execute(f'CREATE SCHEMA IF NOT EXISTS {target}')
             c.execute(f'CREATE TABLE IF NOT EXISTS {target}.published_batches(batch_id VARCHAR PRIMARY KEY,created_at TIMESTAMPTZ,published_at TIMESTAMPTZ,messages BIGINT,events BIGINT)')
