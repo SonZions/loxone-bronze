@@ -6,7 +6,7 @@ from unittest.mock import patch
 import duckdb
 from loxone_bronze.spool import Spool
 from loxone_bronze.local_silver import (LocalConfig,enable_retention_guard,connect_local,
-    import_spool,run,finalize_outbox,process_local_batch,enqueue_remapping)
+    import_spool,run,finalize_outbox,process_local_batch,enqueue_remapping,prune_local_archived)
 from loxone_bronze.silver import sync_structures
 from loxone_bronze.silver_publish import publish_batch,validate_batch,run as publish_run
 from loxone_bronze.local_mapping import sync_local_structure
@@ -51,6 +51,17 @@ class LocalSilverTests(unittest.TestCase):
         c,sc=connect_local(self.cfg);import_spool(c,self.cfg,'ws_messages');c.close()
         self.spool.prune_uploaded(1)
         self.assertEqual(self.spool.status()['messages']['total'],1)
+        self.message('m4')
+        with self.spool.connect() as src:
+            self.assertEqual(src.execute("SELECT rowid FROM ws_messages WHERE message_id='m4'").fetchone()[0],4)
+    def test_local_only_prune_requires_archive_ack_and_preserves_cloud_status(self):
+        self.message();self.message('m2');self.message('m3')
+        self.assertEqual(prune_local_archived(self.cfg)['ws_messages'],0)
+        c,sc=connect_local(self.cfg);import_spool(c,self.cfg,'ws_messages');c.close()
+        self.assertEqual(prune_local_archived(self.cfg)['ws_messages'],2)
+        with self.spool.connect() as src:
+            self.assertEqual(src.execute('SELECT count(*) FROM ws_messages').fetchone()[0],1)
+            self.assertIsNone(src.execute('SELECT uploaded_at FROM ws_messages').fetchone()[0])
         self.message('m4')
         with self.spool.connect() as src:
             self.assertEqual(src.execute("SELECT rowid FROM ws_messages WHERE message_id='m4'").fetchone()[0],4)

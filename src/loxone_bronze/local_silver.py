@@ -7,7 +7,7 @@ from __future__ import annotations
 import argparse
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import fcntl
 import hashlib
 import json
@@ -38,6 +38,8 @@ class LocalConfig:
     max_seconds: int = 90
     memory_mb: int = 96
     min_free_mb: int = 2048
+    spool_retention_days: int = 7
+    prune_local_only: int = 0
 
     @classmethod
     def from_env(cls):
@@ -51,6 +53,8 @@ class LocalConfig:
             raise ValueError('Invalid resource limits')
         if self.database.startswith('md:'):
             raise ValueError('Local database required')
+        if self.spool_retention_days < 1 or self.prune_local_only not in (0, 1):
+            raise ValueError('Invalid local retention settings')
 
 @contextmanager
 def lock(path):
@@ -70,6 +74,25 @@ def enable_retention_guard(path):
     with spool_connection(path) as c:
         c.execute('CREATE TABLE IF NOT EXISTS local_silver_checkpoints(table_name TEXT PRIMARY KEY,rowid_highwater INTEGER NOT NULL)')
         c.executemany('INSERT OR IGNORE INTO local_silver_checkpoints VALUES (?,0)',[(t,) for t in TABLES])
+
+
+def prune_local_archived(cfg,limit=5000):
+    """Bound spool retention by the durable local archive when cloud Bronze is off."""
+    cutoff=(datetime.now(timezone.utc)-timedelta(days=cfg.spool_retention_days)).isoformat(timespec='microseconds')
+    timestamps={'ws_messages':'received_at','structures':'captured_at'}
+    deleted={}
+    with spool_connection(cfg.spool) as src:
+        for table,timestamp in timestamps.items():
+            row=src.execute('SELECT rowid_highwater FROM local_silver_checkpoints WHERE table_name=?',(table,)).fetchone()
+            checkpoint=row[0] if row else 0
+            before=src.total_changes
+            # Retain the last row so SQLite rowids stay monotonic across restarts.
+            src.execute(f'''DELETE FROM {table} WHERE rowid IN (
+              SELECT rowid FROM {table} WHERE {timestamp} < ? AND rowid <= ?
+              AND rowid < (SELECT max(rowid) FROM {table}) ORDER BY {timestamp} LIMIT ?)''',
+              (cutoff,checkpoint,limit))
+            deleted[table]=src.total_changes-before
+    return deleted
 
 
 def connect_local(cfg):
@@ -271,9 +294,11 @@ def run(cfg):
                 result=process_local_batch(c,sc,cfg)
                 if result: batches.append(result); LOG.info('local_batch %s',json.dumps(result))
                 else: break
+            pruned=prune_local_archived(cfg) if cfg.prune_local_only else {}
             summary={'imported':imported,'batches':len(batches),'events':sum(b['events'] for b in batches),
               'pending_messages':c.execute('SELECT count(*) FROM process_queue').fetchone()[0],
               'pending_publications':c.execute("SELECT count(*) FROM publication_queue WHERE status='pending'").fetchone()[0],
+              'pruned_spool_rows':sum(pruned.values()),
               'elapsed_seconds':round(time.monotonic()-start,2)}
             LOG.info('local_summary %s',json.dumps(summary)); return summary
         finally: c.close()
