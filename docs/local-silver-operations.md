@@ -7,7 +7,8 @@ own `my_db.loxone_silver_local`, distinct from the personal account's `my_db`.
 
 ## Data path and limits
 
-- Collector -> existing SQLite spool -> durable local DuckDB Bronze archive.
+- Collector -> existing SQLite spool -> immutable, date-partitioned Parquet Bronze
+  archive. DuckDB remains the bounded Silver working database.
 - Local Python maps structure JSON without duplicating whole control trees in SQL.
   State/details/action/control-key priorities, inherited metadata, temporal
   resolution, ambiguity and late-structure replay follow the existing Silver rules.
@@ -24,7 +25,13 @@ own `my_db.loxone_silver_local`, distinct from the personal account's `my_db`.
 - Work is message-bounded, not event-bounded: one reconnect can contain many states.
   SQLite/DuckDB commits and a hard service timeout make retry safe. Free space below
   2 GiB stops new archival. Monitor failures and growth; disk is not an infinite archive.
-- Local data lives at `/srv/raspi-data/loxone-silver/silver.duckdb` and `outbox/`.
+- Local data lives at `/srv/raspi-data/loxone-silver/silver.duckdb`,
+  `motherduck-bronze/` and `outbox/`. `loxone_bronze.parquet_ws_messages` and
+  `loxone_bronze.parquet_structures` expose the raw archive through DuckDB.
+  Processed raw messages remain in the DuckDB working copy for 30 days by default,
+  then leave it in bounded batches only after Parquet has caught up. A structure
+  arriving later than that working window requires an explicit historical replay
+  from Parquet if old Silver mappings must change.
   Both jobs use `loxonebronze` to avoid widening access to the collector spool.
   Only the publisher loads `/etc/loxone-bronze/motherduck.env` through systemd.
   No credential is copied to Git, arguments or a new environment file.
@@ -40,18 +47,22 @@ for this pipeline, not the exact MotherDuck Bronze ingestion time.
 
 ## Retention and crash recovery
 
-The spool's `local_silver_checkpoints` table enables a second-consumer retention
-gate. Bronze pruning then requires both cloud upload and durable local archival.
+The spool's `local_silver_checkpoints` and `parquet_archive_checkpoints` tables
+form the local retention gate. Local-only pruning requires both the Silver working
+copy and the checksummed Parquet file to have acknowledged a row. Parquet files
+are written below `motherduck-bronze/ws_messages/date=YYYY-MM-DD/` and exposed only
+after an atomic rename; an adjacent manifest records row count, time bounds and
+SHA-256. Structures use the same file/manifest protocol without daily directories.
 The local cursor commits in DuckDB BEFORE its SQLite acknowledgement. Imports use
 stable message IDs, making a crash between those commits safe to retry. The last
 row in each SQLite source table is retained so future rowids remain monotonic.
 Do not VACUUM/rebuild/replace the spool while the rowid-based consumer is active.
 
-The archive is not backed up merely because an upload succeeded. Preserve the
-local DuckDB file and its WAL together, using a stopped worker or DuckDB's supported
-backup/export process. Restoring an archive older than the source acknowledgement
-fails closed; restore/reconcile it before resuming. Do not remove the retention gate
-just to unblock pruning. Already-pruned historical data is not recoverable locally.
+The archive is not backed up merely because a local write succeeded. Preserve the
+Parquet tree, manifests, DuckDB file and its WAL. Restoring any component older than
+its source acknowledgement requires reconciliation before resuming. Do not remove
+the retention gate just to unblock pruning. Already-pruned historical data is not
+recoverable locally.
 
 When raw Bronze upload to MotherDuck is intentionally retired, set
 `LOCAL_SILVER_PRUNE_LOCAL_ONLY=1`. The offline worker then prunes only rows older
