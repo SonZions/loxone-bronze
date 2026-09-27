@@ -12,6 +12,13 @@ ETC_DIR="/etc/loxone-bronze"
 DATA_DIR="/var/lib/loxone-bronze"
 SERVICE_USER="loxonebronze"
 
+if ! mountpoint -q /srv/raspi-data ||
+   [[ ! -L "$DATA_DIR" ]] ||
+   [[ "$(readlink -f "$DATA_DIR")" != /srv/raspi-data/loxone-bronze ]]; then
+  echo "Refusing installation: the Bronze data path must link to the mounted data SSD." >&2
+  exit 1
+fi
+
 python3 - <<'PY'
 import sys
 if sys.version_info < (3, 10):
@@ -62,7 +69,8 @@ echo "  ${ETC_DIR}/motherduck.env"
 echo
 echo "Then enable:"
 echo "  systemctl enable --now loxone-bronze-collector.service"
-echo "  systemctl enable --now loxone-bronze-uploader.timer"
+echo "  # Keep loxone-bronze-uploader.timer disabled on loxberry."
+echo "  # Run the uploader explicitly only through the approved operating procedure."
 echo
 echo "Logs:"
 echo "  journalctl -u loxone-bronze-collector -f"

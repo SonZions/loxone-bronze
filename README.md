@@ -16,12 +16,9 @@ Raspberry / LoxBerry
   │         ├─ raw WebSocket messages
   │         └─ versioned LoxAPP3.json
   │
-  └─ loxone-bronze-uploader.timer (every 5 min)
-       │ HTTPS / MotherDuck
-       ▼
-MotherDuck my_db.loxone_bronze
-  ├─ ws_messages
-  └─ structures
+  ├─ local Silver archive and publisher
+  │    └─ /srv/raspi-data/loxone-silver
+  └─ loxone-bronze-uploader.service (explicit use only)
 ```
 
 ## Why event-driven instead of 1-minute polling?
@@ -39,13 +36,17 @@ still retained losslessly.
 
 1. Collector writes to local SQLite first.
 2. SQLite runs in WAL mode.
-3. Uploader sends batches every five minutes.
+3. On the audited `loxberry` host, local Silver archives the raw data and
+   `loxone-bronze-uploader.timer` is intentionally disabled. Explicit uploader
+   runs remain available when approved.
 4. Every local row has a stable UUID.
 5. MotherDuck primary keys + `INSERT OR IGNORE` make retries idempotent.
 6. Only after a successful MotherDuck statement is the local row marked uploaded.
 7. Uploaded rows remain locally for 7 days by default.
 
-If internet/MotherDuck is unavailable, the backlog simply grows locally.
+When publication is unavailable, local archive and outbox data may grow. Check
+free space and the local Silver retention gate before assuming old spool rows
+can be reclaimed.
 
 ## Security
 
@@ -91,7 +92,7 @@ Start:
 
 ```bash
 sudo systemctl enable --now loxone-bronze-collector.service
-sudo systemctl enable --now loxone-bronze-uploader.timer
+# Keep loxone-bronze-uploader.timer disabled on loxberry.
 ```
 
 Check:
@@ -100,7 +101,7 @@ Check:
 sudo journalctl -u loxone-bronze-collector -f
 sudo journalctl -u loxone-bronze-uploader -n 100
 sudo bash /opt/loxone-bronze/app/scripts/healthcheck.sh
-systemctl list-timers | grep loxone-bronze
+systemctl is-enabled loxone-bronze-uploader.timer
 ```
 
 ## Suggested Loxone user
@@ -112,7 +113,8 @@ dataset.
 
 ## Local files
 
-- spool: `/var/lib/loxone-bronze/spool.sqlite3`
+- spool: `/var/lib/loxone-bronze/spool.sqlite3` through a symlink to
+  `/srv/raspi-data/loxone-bronze/spool.sqlite3`
 - Loxone credentials: `/etc/loxone-bronze/collector.env`
 - MotherDuck token: `/etc/loxone-bronze/motherduck.env`
 
