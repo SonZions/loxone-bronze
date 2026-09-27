@@ -2,6 +2,7 @@
 Description=Loxone Bronze WebSocket Collector
 After=network-online.target
 Wants=network-online.target
+RequiresMountsFor=/srv/raspi-data/loxone-bronze
 
 [Service]
 Type=simple

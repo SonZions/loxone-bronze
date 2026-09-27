@@ -2,6 +2,7 @@
 Description=Loxone Bronze MotherDuck Uploader
 After=network-online.target loxone-bronze-collector.service
 Wants=network-online.target
+RequiresMountsFor=/srv/raspi-data/loxone-bronze
 
 [Service]
 Type=oneshot
