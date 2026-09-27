@@ -32,13 +32,16 @@ class LocalConfig:
     spool: str = '/var/lib/loxone-bronze/spool.sqlite3'
     database: str = '/srv/raspi-data/loxone-silver/silver.duckdb'
     outbox: str = '/srv/raspi-data/loxone-silver/outbox'
+    bronze_archive: str = '/srv/raspi-data/loxone-silver/motherduck-bronze'
     batch_size: int = 50
     import_size: int = 250
+    archive_size: int = 5000
     max_batches: int = 5
     max_seconds: int = 90
     memory_mb: int = 96
     min_free_mb: int = 2048
     spool_retention_days: int = 7
+    working_retention_days: int = 30
     prune_local_only: int = 0
 
     @classmethod
@@ -47,13 +50,13 @@ class LocalConfig:
                      for k,v in cls().__dict__.items()})
 
     def validate(self):
-        if not 1 <= self.batch_size <= 1000 or not 1 <= self.import_size <= 10000:
+        if not 1 <= self.batch_size <= 1000 or not 1 <= self.import_size <= 10000 or not 1 <= self.archive_size <= 50000:
             raise ValueError('Invalid batch size')
         if not 1 <= self.max_batches <= 1000 or not 1 <= self.max_seconds <= 3600 or not 32 <= self.memory_mb <= 4096:
             raise ValueError('Invalid resource limits')
         if self.database.startswith('md:'):
             raise ValueError('Local database required')
-        if self.spool_retention_days < 1 or self.prune_local_only not in (0, 1):
+        if self.spool_retention_days < 1 or self.working_retention_days < 1 or self.prune_local_only not in (0, 1):
             raise ValueError('Invalid local retention settings')
 
 @contextmanager
@@ -73,7 +76,9 @@ def spool_connection(path):
 def enable_retention_guard(path):
     with spool_connection(path) as c:
         c.execute('CREATE TABLE IF NOT EXISTS local_silver_checkpoints(table_name TEXT PRIMARY KEY,rowid_highwater INTEGER NOT NULL)')
+        c.execute('CREATE TABLE IF NOT EXISTS parquet_archive_checkpoints(table_name TEXT PRIMARY KEY,rowid_highwater INTEGER NOT NULL)')
         c.executemany('INSERT OR IGNORE INTO local_silver_checkpoints VALUES (?,0)',[(t,) for t in TABLES])
+        c.executemany('INSERT OR IGNORE INTO parquet_archive_checkpoints VALUES (?,0)',[(t,) for t in TABLES])
 
 
 def prune_local_archived(cfg,limit=5000):
@@ -83,8 +88,9 @@ def prune_local_archived(cfg,limit=5000):
     deleted={}
     with spool_connection(cfg.spool) as src:
         for table,timestamp in timestamps.items():
-            row=src.execute('SELECT rowid_highwater FROM local_silver_checkpoints WHERE table_name=?',(table,)).fetchone()
-            checkpoint=row[0] if row else 0
+            silver=src.execute('SELECT rowid_highwater FROM local_silver_checkpoints WHERE table_name=?',(table,)).fetchone()
+            parquet=src.execute('SELECT rowid_highwater FROM parquet_archive_checkpoints WHERE table_name=?',(table,)).fetchone()
+            checkpoint=min(silver[0] if silver else 0,parquet[0] if parquet else 0)
             before=src.total_changes
             # Retain the last row so SQLite rowids stay monotonic across restarts.
             src.execute(f'''DELETE FROM {table} WHERE rowid IN (
@@ -127,7 +133,126 @@ def connect_local(cfg):
     sc=SilverConfig(source_database=db,target_database=db,batch_size=cfg.batch_size)
     initialize(c,sc)
     c.execute('CREATE TABLE IF NOT EXISTS latest_events AS SELECT * FROM loxone_silver.state_events LIMIT 0')
+    refresh_archive_views(c,cfg)
     return c,sc
+
+
+ARCHIVE_COLUMNS={
+    'ws_messages':('message_id','source_id','received_at','message_type','ingested_at','payload_json',
+                   'run_id','payload_format','payload_sha256','collector_version'),
+    'structures':('structure_id','source_id','captured_at','last_modified','payload_json',
+                  'payload_sha256','collector_version','ingested_at'),
+}
+
+
+def _archive_types(columns):
+    return {name:('TIMESTAMPTZ' if name in ('received_at','captured_at','ingested_at')
+                  else 'INTEGER' if name=='message_type' else 'VARCHAR') for name in columns}
+
+
+def _write_manifest(path,manifest):
+    temporary=path.with_suffix(path.suffix+'.tmp')
+    with temporary.open('w') as output:
+        json.dump(manifest,output,sort_keys=True)
+        output.write('\n');output.flush();os.fsync(output.fileno())
+    os.replace(temporary,path)
+    _fsync_directory(path.parent)
+
+
+def _fsync_directory(path):
+    descriptor=os.open(path,os.O_RDONLY|getattr(os,'O_DIRECTORY',0))
+    try:os.fsync(descriptor)
+    finally:os.close(descriptor)
+
+
+def _archive_partition(c,cfg,table,rows,partition):
+    root=Path(cfg.bronze_archive)/table
+    if table=='ws_messages': root=root/('date='+partition)
+    root.mkdir(parents=True,exist_ok=True,mode=0o700)
+    first,last=rows[0]['spool_rowid'],rows[-1]['spool_rowid']
+    stem=f'local-{first:020d}-{last:020d}'
+    final=root/(stem+'.parquet'); temporary=root/(stem+'.parquet.tmp')
+    columns=ARCHIVE_COLUMNS[table]
+    placeholders=','.join('?' for _ in columns)
+    c.execute('CREATE OR REPLACE TEMP TABLE archive_rows('+','.join(
+      name+' '+kind for name,kind in _archive_types(columns).items())+')')
+    now=datetime.now(timezone.utc)
+    values=[]
+    for row in rows:
+        values.append(tuple(now if name=='ingested_at' else row[name] for name in columns))
+    c.executemany('INSERT INTO archive_rows VALUES ('+placeholders+')',values)
+    if temporary.exists(): temporary.unlink()
+    c.execute('COPY archive_rows TO ? (FORMAT PARQUET,COMPRESSION ZSTD)',[str(temporary)])
+    with temporary.open('rb') as stream: os.fsync(stream.fileno())
+    os.replace(temporary,final)
+    _fsync_directory(root)
+    manifest={'version':1,'table':table,'file':final.name,'sha256':sha256(final),'rows':len(rows),
+      'spool_rowid_first':first,'spool_rowid_last':last,
+      'minimum_timestamp':min(row['received_at' if table=='ws_messages' else 'captured_at'] for row in rows),
+      'maximum_timestamp':max(row['received_at' if table=='ws_messages' else 'captured_at'] for row in rows)}
+    _write_manifest(root/(stem+'.manifest.json'),manifest)
+    return final
+
+
+def refresh_archive_views(c,cfg):
+    root=str(Path(cfg.bronze_archive)).replace("'","''")
+    messages=Path(cfg.bronze_archive)/'ws_messages'
+    structures=Path(cfg.bronze_archive)/'structures'
+    if any(messages.glob('date=*/*.parquet')):
+        columns=','.join(ARCHIVE_COLUMNS['ws_messages'])
+        c.execute(f"CREATE OR REPLACE VIEW loxone_bronze.parquet_ws_messages_raw AS SELECT {columns} FROM read_parquet('{root}/ws_messages/date=*/*.parquet',union_by_name=true,hive_partitioning=true)")
+        c.execute(f'''CREATE OR REPLACE VIEW loxone_bronze.parquet_ws_messages AS
+          SELECT {columns} FROM loxone_bronze.parquet_ws_messages_raw
+          QUALIFY row_number() OVER(PARTITION BY source_id,message_id ORDER BY ingested_at DESC)=1''')
+    if any(structures.glob('*.parquet')):
+        columns=','.join(ARCHIVE_COLUMNS['structures'])
+        c.execute(f"CREATE OR REPLACE VIEW loxone_bronze.parquet_structures_raw AS SELECT {columns} FROM read_parquet('{root}/structures/*.parquet',union_by_name=true)")
+        c.execute(f'''CREATE OR REPLACE VIEW loxone_bronze.parquet_structures AS
+          SELECT {columns} FROM loxone_bronze.parquet_structures_raw
+          QUALIFY row_number() OVER(PARTITION BY structure_id ORDER BY captured_at DESC,ingested_at DESC)=1''')
+
+
+def archive_spool(c,cfg,table):
+    """Persist a bounded SQLite slice as immutable Parquet, then acknowledge it."""
+    if table not in TABLES: raise ValueError('Invalid source table')
+    with spool_connection(cfg.spool) as src:
+        row=src.execute('SELECT rowid_highwater FROM parquet_archive_checkpoints WHERE table_name=?',(table,)).fetchone()
+        cursor=row[0] if row else 0
+        selected=src.execute(f'SELECT rowid AS spool_rowid,* FROM {table} WHERE rowid>? ORDER BY rowid LIMIT ?',
+                             (cursor,cfg.archive_size if table=='ws_messages' else min(cfg.archive_size,100)))
+        rows=[];payload_bytes=0
+        for record in selected:
+            rows.append(record);payload_bytes+=len(record['payload_json'].encode())
+            if payload_bytes>=32*1024*1024: break
+    if not rows:return 0
+    groups={}
+    for row in rows:
+        partition=row['received_at'][:10] if table=='ws_messages' else 'structures'
+        groups.setdefault(partition,[]).append(row)
+    for partition,group in groups.items():_archive_partition(c,cfg,table,group,partition)
+    cursor=rows[-1]['spool_rowid']
+    # Files and manifests are durable before the pruning gate advances.
+    with spool_connection(cfg.spool) as src:
+        src.execute('INSERT OR REPLACE INTO parquet_archive_checkpoints VALUES (?,?)',(table,cursor))
+    refresh_archive_views(c,cfg)
+    return len(rows)
+
+
+def prune_working_archive(c,cfg,limit=5000):
+    """Bound DuckDB raw working data only after Parquet has caught up."""
+    imported=c.execute("SELECT rowid_highwater FROM import_progress WHERE table_name='ws_messages'").fetchone()
+    with spool_connection(cfg.spool) as src:
+        parquet=src.execute("SELECT rowid_highwater FROM parquet_archive_checkpoints WHERE table_name='ws_messages'").fetchone()
+    if not imported or not parquet or parquet[0] < imported[0]:return 0
+    cutoff=datetime.now(timezone.utc)-timedelta(days=cfg.working_retention_days)
+    c.execute('''CREATE OR REPLACE TEMP TABLE expired_working_messages AS
+      SELECT a.source_id,a.message_id FROM loxone_bronze.archive_messages a
+      SEMI JOIN loxone_silver.processed_messages p USING(source_id,message_id)
+      ANTI JOIN process_queue q USING(source_id,message_id)
+      WHERE a.received_at < ? ORDER BY a.received_at LIMIT ?''',[cutoff,limit])
+    count=c.execute('SELECT count(*) FROM expired_working_messages').fetchone()[0]
+    if count:c.execute('DELETE FROM loxone_bronze.archive_messages USING expired_working_messages e WHERE archive_messages.source_id=e.source_id AND archive_messages.message_id=e.message_id')
+    return count
 
 
 def import_spool(c,cfg,table):
@@ -279,6 +404,7 @@ def run(cfg):
         try:
             finalize_outbox(c,cfg)
             start=time.monotonic(); imported=0; batches=[]
+            archived={table:archive_spool(c,cfg,table) for table in TABLES}
             for _ in range(cfg.max_batches):
                 if time.monotonic()-start>=cfg.max_seconds: break
                 structures=import_spool(c,cfg,'structures')
@@ -295,10 +421,11 @@ def run(cfg):
                 if result: batches.append(result); LOG.info('local_batch %s',json.dumps(result))
                 else: break
             pruned=prune_local_archived(cfg) if cfg.prune_local_only else {}
-            summary={'imported':imported,'batches':len(batches),'events':sum(b['events'] for b in batches),
+            working_pruned=prune_working_archive(c,cfg)
+            summary={'archived':archived,'imported':imported,'batches':len(batches),'events':sum(b['events'] for b in batches),
               'pending_messages':c.execute('SELECT count(*) FROM process_queue').fetchone()[0],
               'pending_publications':c.execute("SELECT count(*) FROM publication_queue WHERE status='pending'").fetchone()[0],
-              'pruned_spool_rows':sum(pruned.values()),
+              'pruned_spool_rows':sum(pruned.values()),'pruned_working_messages':working_pruned,
               'elapsed_seconds':round(time.monotonic()-start,2)}
             LOG.info('local_summary %s',json.dumps(summary)); return summary
         finally: c.close()

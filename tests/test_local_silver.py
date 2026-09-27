@@ -6,7 +6,8 @@ from unittest.mock import patch
 import duckdb
 from loxone_bronze.spool import Spool
 from loxone_bronze.local_silver import (LocalConfig,enable_retention_guard,connect_local,
-    import_spool,run,finalize_outbox,process_local_batch,enqueue_remapping,prune_local_archived)
+    archive_spool,import_spool,run,finalize_outbox,process_local_batch,enqueue_remapping,
+    prune_local_archived,prune_working_archive,sha256)
 from loxone_bronze.silver import sync_structures
 from loxone_bronze.silver_publish import publish_batch,validate_batch,run as publish_run
 from loxone_bronze.local_mapping import sync_local_structure
@@ -18,7 +19,8 @@ class LocalSilverTests(unittest.TestCase):
         self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup)
         self.root=Path(self.tmp.name); self.spool=Spool(str(self.root/'spool.sqlite3'))
         self.cfg=LocalConfig(spool=str(self.spool.path),database=str(self.root/'silver.duckdb'),
-          outbox=str(self.root/'outbox'),batch_size=2,import_size=3,max_batches=4,min_free_mb=0)
+          outbox=str(self.root/'outbox'),bronze_archive=str(self.root/'bronze'),batch_size=2,
+          import_size=3,archive_size=3,max_batches=4,min_free_mb=0)
         enable_retention_guard(self.cfg.spool)
     def message(self,mid='m1',value=1,at='2026-09-01T00:00:00+00:00'):
         self.spool.insert_message(message_id=mid,source_id='home',run_id='r',received_at=at,
@@ -57,7 +59,9 @@ class LocalSilverTests(unittest.TestCase):
     def test_local_only_prune_requires_archive_ack_and_preserves_cloud_status(self):
         self.message();self.message('m2');self.message('m3')
         self.assertEqual(prune_local_archived(self.cfg)['ws_messages'],0)
-        c,sc=connect_local(self.cfg);import_spool(c,self.cfg,'ws_messages');c.close()
+        c,sc=connect_local(self.cfg);import_spool(c,self.cfg,'ws_messages')
+        self.assertEqual(prune_local_archived(self.cfg)['ws_messages'],0)
+        archive_spool(c,self.cfg,'ws_messages');c.close()
         self.assertEqual(prune_local_archived(self.cfg)['ws_messages'],2)
         with self.spool.connect() as src:
             self.assertEqual(src.execute('SELECT count(*) FROM ws_messages').fetchone()[0],1)
@@ -123,7 +127,11 @@ class LocalSilverTests(unittest.TestCase):
         finally:c.close()
     def test_failed_export_rolls_back_and_retry_has_no_duplicate(self):
         self.structure();self.message()
-        with patch('loxone_bronze.local_silver.sha256',side_effect=OSError('simulated export failure')):
+        real_sha256=sha256
+        def fail_outbox(path):
+            if str(self.root/'outbox') in str(path):raise OSError('simulated export failure')
+            return real_sha256(path)
+        with patch('loxone_bronze.local_silver.sha256',side_effect=fail_outbox):
             with self.assertRaises(OSError):run(self.cfg)
         with duckdb.connect(self.cfg.database) as c:
             self.assertEqual(c.execute('SELECT count(*) FROM loxone_silver.state_events').fetchone()[0],0)
@@ -143,5 +151,28 @@ class LocalSilverTests(unittest.TestCase):
         path=next(Path(self.cfg.outbox).glob('*/manifest.json')).parent
         (path/'state_events.parquet').write_bytes(b'corrupt')
         with self.assertRaises(ValueError):validate_batch(path)
+
+    def test_parquet_archive_is_partitioned_checksummed_and_queryable(self):
+        self.structure();self.message();self.message('m2',at='2026-09-02T00:00:00+00:00')
+        c,sc=connect_local(self.cfg)
+        try:
+            self.assertEqual(archive_spool(c,self.cfg,'structures'),1)
+            self.assertEqual(archive_spool(c,self.cfg,'ws_messages'),2)
+            self.assertEqual(archive_spool(c,self.cfg,'ws_messages'),0)
+            self.assertEqual(c.execute('SELECT count(*) FROM loxone_bronze.parquet_ws_messages').fetchone()[0],2)
+            self.assertEqual(c.execute('SELECT count(*) FROM loxone_bronze.parquet_structures').fetchone()[0],1)
+        finally:c.close()
+        manifests=list((self.root/'bronze'/'ws_messages').glob('date=*/*.manifest.json'))
+        self.assertEqual(len(manifests),2)
+        for path in manifests:
+            manifest=json.loads(path.read_text())
+            self.assertEqual(sha256(path.parent/manifest['file']),manifest['sha256'])
+
+    def test_working_bronze_is_pruned_only_after_processing_and_parquet(self):
+        self.cfg.working_retention_days=1
+        self.message(at='2020-01-01T00:00:00+00:00');run(self.cfg)
+        with duckdb.connect(self.cfg.database) as c:
+            self.assertEqual(c.execute('SELECT count(*) FROM loxone_bronze.archive_messages').fetchone()[0],0)
+            self.assertEqual(c.execute('SELECT count(*) FROM loxone_bronze.parquet_ws_messages').fetchone()[0],1)
 
 if __name__=='__main__':unittest.main()
