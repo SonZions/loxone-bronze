@@ -173,14 +173,16 @@ def _archive_partition(c,cfg,table,rows,partition):
     stem=f'local-{first:020d}-{last:020d}'
     final=root/(stem+'.parquet'); temporary=root/(stem+'.parquet.tmp')
     columns=ARCHIVE_COLUMNS[table]
-    placeholders=','.join('?' for _ in columns)
-    c.execute('CREATE OR REPLACE TEMP TABLE archive_rows('+','.join(
-      name+' '+kind for name,kind in _archive_types(columns).items())+')')
-    now=datetime.now(timezone.utc)
-    values=[]
-    for row in rows:
-        values.append(tuple(now if name=='ingested_at' else row[name] for name in columns))
-    c.executemany('INSERT INTO archive_rows VALUES ('+placeholders+')',values)
+    types=_archive_types(columns)
+    schema=','.join("'"+name+"':'"+kind+"'" for name,kind in types.items())
+    now=datetime.now(timezone.utc).isoformat();max_record=1024*1024
+    with tempfile.TemporaryDirectory(prefix='parquet-archive-') as tmp:
+        source=Path(tmp)/'rows.jsonl'
+        with source.open('w') as output:
+            for row in rows:
+                record={name:(now if name=='ingested_at' else row[name]) for name in columns}
+                line=json.dumps(record)+'\n';max_record=max(max_record,len(line)+1);output.write(line)
+        c.execute(f"CREATE OR REPLACE TEMP TABLE archive_rows AS SELECT * FROM read_json(?,columns={{{schema}}},format='newline_delimited',maximum_object_size={max_record})",[str(source)])
     if temporary.exists(): temporary.unlink()
     c.execute('COPY archive_rows TO ? (FORMAT PARQUET,COMPRESSION ZSTD)',[str(temporary)])
     with temporary.open('rb') as stream: os.fsync(stream.fileno())
