@@ -168,6 +168,15 @@ class LocalSilverTests(unittest.TestCase):
             manifest=json.loads(path.read_text())
             self.assertEqual(sha256(path.parent/manifest['file']),manifest['sha256'])
 
+    def test_parquet_bulk_archive_preserves_raw_metadata(self):
+        self.message();c,sc=connect_local(self.cfg)
+        try:
+            archive_spool(c,self.cfg,'ws_messages')
+            row=c.execute('''SELECT run_id,payload_format,payload_sha256,collector_version
+              FROM loxone_bronze.parquet_ws_messages''').fetchone()
+            self.assertEqual(row,('r','json','h','test'))
+        finally:c.close()
+
     def test_working_bronze_is_pruned_only_after_processing_and_parquet(self):
         self.cfg.working_retention_days=1
         self.message(at='2020-01-01T00:00:00+00:00');run(self.cfg)
