@@ -34,12 +34,24 @@ if ! flock -n 9; then
   exit 1
 fi
 
-for required in "$repo/.git" "$venv/bin/pip"; do
+mountpoint -q /srv/raspi-data || {
+  echo "Data SSD is not mounted at /srv/raspi-data." >&2
+  exit 1
+}
+if [[ ! -L "$state_dir" ]] || [[ "$(readlink -f "$state_dir")" != /srv/raspi-data/loxone-bronze ]]; then
+  echo "Refusing deploy: $state_dir must link to the data SSD." >&2
+  exit 1
+fi
+for required in "$repo/.git" /etc/loxone-bronze/collector.env; do
   [[ -e "$required" ]] || {
     echo "Missing required deployment path: $required" >&2
     exit 1
   }
 done
+had_previous_runtime=false
+if [[ -x "$venv/bin/pip" && -d "$app_dir" ]]; then
+  had_previous_runtime=true
+fi
 
 current_sha="$(runuser -u "$repo_user" -- git -C "$repo" rev-parse HEAD)"
 previous_sha="$current_sha"
@@ -94,18 +106,23 @@ rollback() {
   systemctl stop "$collector" || true
 
   runuser -u "$repo_user" -- git -C "$repo" reset --hard "$previous_sha" || true
-  sync_app || true
-  "$venv/bin/pip" install --no-deps --force-reinstall "$app_dir" || true
+  if "$had_previous_runtime"; then
+    sync_app || true
+    "$venv/bin/pip" install --no-deps --force-reinstall "$app_dir" || true
+  else
+    echo "First installation failed; no previous Bronze runtime exists to restore." >&2
+  fi
   install_units || true
   systemctl daemon-reload || true
-  systemctl restart "$collector" || true
+  if "$had_previous_runtime"; then
+    systemctl restart "$collector" || true
+  fi
   if "$timer_was_active"; then
     systemctl start "$timer" || true
   fi
 
   exit "$exit_code"
 }
-trap rollback ERR
 
 runuser -u "$repo_user" -- git -C "$repo" fetch --prune origin main
 remote_sha="$(runuser -u "$repo_user" -- git -C "$repo" rev-parse origin/main)"
@@ -114,6 +131,12 @@ if [[ "$remote_sha" != "$expected_sha" ]]; then
   echo "Refusing deploy: approved SHA is $expected_sha, origin/main is $remote_sha." >&2
   exit 1
 fi
+
+if [[ ! -x "$venv/bin/pip" ]]; then
+  install -d -o root -g root -m 0755 /opt/loxone-bronze
+  python3 -m venv "$venv"
+fi
+trap rollback ERR
 
 echo "Deploying Loxone Bronze commit $expected_sha"
 echo "Rollback target is $previous_sha"

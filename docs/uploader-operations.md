@@ -2,6 +2,12 @@
 
 ## Cause and implementation
 
+On the audited `loxberry` host, `loxone-bronze-uploader.timer` is disabled
+by design. Local Silver archive and publication are active, with local-only
+spool pruning configured. Do not re-enable the Bronze uploader timer as part
+of recovery or a routine deploy. The timer procedure below applies only to
+an explicitly approved return to direct Bronze uploads.
+
 The old one-batch timer can acknowledge at most 1,000 × 288 = 288,000
 messages/day before accounting for failures. That cannot keep up with
 300,000–323,000 arrivals/day. `executemany` adds per-row staging overhead.
@@ -184,10 +190,11 @@ the upload timer. Existing environment files/secrets remain untouched.
    workflow timeout is thirty minutes, including the separate Silver phase; a very large first index build may need
    a longer planned maintenance window. `install.sh` is for initial installation;
    do not run it over a live deployment instead of the controlled bridge.
-5. Enable the timer if it was previously disabled, and trigger one run:
+5. On `loxberry`, leave the timer disabled. If direct Bronze uploads are
+   explicitly resumed, first review the local Silver retention mode and then
+   trigger a controlled run:
 
    ```bash
-   sudo systemctl enable --now loxone-bronze-uploader.timer
    sudo systemctl start loxone-bronze-uploader.service
    ```
 

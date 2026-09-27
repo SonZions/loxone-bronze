@@ -5,6 +5,11 @@ collector and existing Bronze uploader remain in service. No existing cloud
 Silver tables are dropped or repurposed. The ingest account publishes into its
 own `my_db.loxone_silver_local`, distinct from the personal account's `my_db`.
 
+On the audited `loxberry` host, local Silver and its publication timer are
+active, local-only spool pruning is enabled, and the Bronze uploader timer is
+disabled. Recovery must preserve this combination unless the operating mode
+is deliberately changed.
+
 ## Data path and limits
 
 - Collector -> existing SQLite spool -> immutable, date-partitioned Parquet Bronze
