@@ -1,13 +1,15 @@
 import json
 from pathlib import Path
 import tempfile
+import threading
+import time
 import unittest
 from unittest.mock import patch
 import duckdb
 from loxone_bronze.spool import Spool
 from loxone_bronze.local_silver import (LocalConfig,enable_retention_guard,connect_local,
     archive_spool,import_spool,run,finalize_outbox,process_local_batch,enqueue_remapping,
-    prune_local_archived,prune_working_archive,sha256)
+    prune_local_archived,prune_working_archive,sha256,lock)
 from loxone_bronze.silver import sync_structures
 from loxone_bronze.silver_publish import publish_batch,validate_batch,run as publish_run
 from loxone_bronze.local_mapping import sync_local_structure
@@ -56,6 +58,33 @@ class LocalSilverTests(unittest.TestCase):
         self.message('m4')
         with self.spool.connect() as src:
             self.assertEqual(src.execute("SELECT rowid FROM ws_messages WHERE message_id='m4'").fetchone()[0],4)
+    def test_import_skips_message_already_restored_from_cloud_history(self):
+        self.message('old',value=7)
+        self.message('new',value=8)
+        c,sc=connect_local(self.cfg)
+        try:
+            c.execute('''INSERT INTO loxone_bronze.archive_messages VALUES
+              ('old','home','2026-09-01T00:00:00+00:00',2,
+               '2026-09-01T00:00:00+00:00','{"parsed":{}}')''')
+            self.assertEqual(import_spool(c,self.cfg,'ws_messages'),2)
+            self.assertEqual(c.execute('SELECT count(*) FROM loxone_bronze.archive_messages').fetchone()[0],2)
+            self.assertEqual(c.execute("SELECT payload_json FROM loxone_bronze.archive_messages WHERE message_id='old'").fetchone()[0],'{"parsed":{}}')
+            self.assertEqual(c.execute('SELECT message_id FROM process_queue').fetchall(),[('new',)])
+            self.assertEqual(c.execute("SELECT rowid_highwater FROM import_progress WHERE table_name='ws_messages'").fetchone()[0],2)
+        finally:c.close()
+    def test_publisher_can_wait_for_active_local_worker_lock(self):
+        acquired=[]
+        path=self.root/'pipeline.lock'
+        def publisher():
+            with lock(path,wait_seconds=2): acquired.append(True)
+        with lock(path):
+            thread=threading.Thread(target=publisher)
+            thread.start()
+            time.sleep(0.1)
+            self.assertEqual(acquired,[])
+        thread.join(timeout=2)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(acquired,[True])
     def test_local_only_prune_requires_archive_ack_and_preserves_cloud_status(self):
         self.message();self.message('m2');self.message('m3')
         self.assertEqual(prune_local_archived(self.cfg)['ws_messages'],0)
