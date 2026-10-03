@@ -221,7 +221,7 @@ def refresh_archive_views(c,cfg):
           QUALIFY row_number() OVER(PARTITION BY structure_id ORDER BY captured_at DESC,ingested_at DESC)=1''')
 
 
-def archive_spool(c,cfg,table):
+def archive_spool(c,cfg,table,refresh_views=True):
     """Persist a bounded SQLite slice as immutable Parquet, then acknowledge it."""
     if table not in TABLES: raise ValueError('Invalid source table')
     with spool_connection(cfg.spool) as src:
@@ -243,7 +243,7 @@ def archive_spool(c,cfg,table):
     # Files and manifests are durable before the pruning gate advances.
     with spool_connection(cfg.spool) as src:
         src.execute('INSERT OR REPLACE INTO parquet_archive_checkpoints VALUES (?,?)',(table,cursor))
-    refresh_archive_views(c,cfg)
+    if refresh_views: refresh_archive_views(c,cfg)
     return len(rows)
 
 
@@ -421,7 +421,6 @@ def run(cfg):
         try:
             finalize_outbox(c,cfg)
             start=time.monotonic(); imported=0; batches=[]
-            archived={table:archive_spool(c,cfg,table) for table in TABLES}
             for _ in range(cfg.max_batches):
                 if time.monotonic()-start>=cfg.max_seconds: break
                 structures=import_spool(c,cfg,'structures')
@@ -439,7 +438,7 @@ def run(cfg):
                 else: break
             pruned=prune_local_archived(cfg) if cfg.prune_local_only else {}
             working_pruned=prune_working_archive(c,cfg)
-            summary={'archived':archived,'imported':imported,'batches':len(batches),'events':sum(b['events'] for b in batches),
+            summary={'imported':imported,'batches':len(batches),'events':sum(b['events'] for b in batches),
               'pending_messages':c.execute('SELECT count(*) FROM process_queue').fetchone()[0],
               'pending_publications':c.execute("SELECT count(*) FROM publication_queue WHERE status='pending'").fetchone()[0],
               'pruned_spool_rows':sum(pruned.values()),'pruned_working_messages':working_pruned,
