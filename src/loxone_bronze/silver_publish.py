@@ -80,7 +80,9 @@ def combine_batches(batches,destination):
 def run(outbox,database='my_db',schema='loxone_silver_local',max_batches=100,max_seconds=180,connect=None):
     target=identifier(database)+'.'+identifier(schema)
     root=Path(outbox);root.mkdir(parents=True,exist_ok=True)
-    with lock(root.parent/'pipeline.lock'),lock(root/'publish.lock'):
+    # The local worker runs frequently. Wait for its bounded run instead of
+    # missing every publication slot when both timers happen to align.
+    with lock(root.parent/'pipeline.lock',wait_seconds=120),lock(root/'publish.lock'):
         directories=sorted(p.parent for p in root.glob('*/manifest.json') if not (p.parent/'ACK').exists())
         if not directories:return {'published':0}
         start=time.monotonic();batches=[];size=0

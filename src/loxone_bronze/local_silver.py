@@ -60,9 +60,16 @@ class LocalConfig:
             raise ValueError('Invalid local retention settings')
 
 @contextmanager
-def lock(path):
+def lock(path, wait_seconds=0):
     with Path(path).open('a') as f:
-        fcntl.flock(f,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        deadline=time.monotonic()+wait_seconds
+        while True:
+            try:
+                fcntl.flock(f,fcntl.LOCK_EX|fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic()>=deadline: raise
+                time.sleep(min(0.5,deadline-time.monotonic()))
         yield
 
 
@@ -293,8 +300,16 @@ def import_spool(c,cfg,table):
             c.execute(f"CREATE OR REPLACE TEMP TABLE import_rows AS SELECT * FROM read_json(?,columns={{{schema}}},format='newline_delimited',maximum_object_size={max_record})",[str(path)])
         if table=='ws_messages':
             c.execute('INSERT OR IGNORE INTO process_queue SELECT source_id,message_id FROM import_rows r WHERE NOT EXISTS(SELECT 1 FROM loxone_bronze.archive_messages a WHERE a.source_id=r.source_id AND a.message_id=r.message_id)')
+        # Cloud-history backfills can already have the same message in the working
+        # archive while the SQLite rowid cursor is still behind it. Filter those
+        # rows before the insert: DuckDB's conflict handler is not reliable for
+        # every bulk INSERT .. SELECT against a primary-key table.
         target='archive_messages' if table=='ws_messages' else 'structures'
-        c.execute(f'INSERT OR IGNORE INTO loxone_bronze.{target} BY NAME SELECT * REPLACE(payload_json::JSON AS payload_json) FROM import_rows')
+        keys=('source_id','message_id') if table=='ws_messages' else ('structure_id',)
+        condition=' AND '.join(f'a.{key}=r.{key}' for key in keys)
+        c.execute(f'''INSERT INTO loxone_bronze.{target} BY NAME
+          SELECT * REPLACE(payload_json::JSON AS payload_json) FROM import_rows r
+          WHERE NOT EXISTS (SELECT 1 FROM loxone_bronze.{target} a WHERE {condition})''')
         c.execute('DROP TABLE import_rows')
         cursor=rows[-1]['spool_rowid']
         c.execute('INSERT OR REPLACE INTO import_progress VALUES (?,?)',[table,cursor])
