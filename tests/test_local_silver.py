@@ -16,6 +16,7 @@ from loxone_bronze.local_silver import (LocalConfig,enable_retention_guard,conne
 from loxone_bronze.silver import sync_structures
 from loxone_bronze.silver_publish import publish_batch,validate_batch,run as publish_run
 from loxone_bronze.local_mapping import sync_local_structure
+from loxone_bronze.bronze_archive import ArchiveConfig,run as archive_run
 
 STATE='12345678-1234-1234-1234567890abcdef'
 
@@ -229,7 +230,9 @@ class LocalSilverTests(unittest.TestCase):
 
     def test_working_bronze_is_pruned_only_after_processing_and_parquet(self):
         self.cfg.working_retention_days=1
-        self.message(at='2020-01-01T00:00:00+00:00');run(self.cfg)
+        self.message(at='2020-01-01T00:00:00+00:00')
+        archive_run(ArchiveConfig(self.cfg.spool,self.cfg.bronze_archive,min_free_mb=0))
+        run(self.cfg)
         with duckdb.connect(self.cfg.database) as c:
             self.assertEqual(c.execute('SELECT count(*) FROM loxone_bronze.archive_messages').fetchone()[0],0)
             self.assertEqual(c.execute('SELECT count(*) FROM loxone_bronze.parquet_ws_messages').fetchone()[0],1)

@@ -5,10 +5,11 @@ set -Eeuo pipefail
 release="$(readlink -f "${1:?Expected immutable installed Silver release}")"
 [[ "$release" == /opt/loxone-silver/releases/* && -x "$release/venv/bin/python" ]] || exit 2
 base=/opt/loxone-local-silver
-units=(loxone-local-silver.service loxone-local-silver.timer loxone-silver-publish.service loxone-silver-publish.timer)
-timers=(loxone-local-silver.timer loxone-silver-publish.timer)
+units=(loxone-local-silver.service loxone-local-silver.timer loxone-silver-publish.service loxone-silver-publish.timer loxone-bronze-archive.service loxone-bronze-archive.timer)
+timers=(loxone-local-silver.timer loxone-silver-publish.timer loxone-bronze-archive.timer)
 install -d -o root -g root -m 0755 "$base"
 install -d -o loxonebronze -g loxonebronze -m 0700 /srv/raspi-data/loxone-silver
+install -d -o loxonebronze -g loxonebronze -m 0700 /srv/raspi-data/loxone-silver/motherduck-bronze
 if [[ ! -f /etc/loxone-silver/local.env ]]; then
   install -o root -g root -m 0600 "$release/app/config/local-silver.env.example" /etc/loxone-silver/local.env
 fi
@@ -24,7 +25,7 @@ for timer in "${timers[@]}"; do
   if systemctl is-active --quiet "$timer"; then active+=("$timer"); fi
   if systemctl cat "$timer" >/dev/null 2>&1; then systemctl stop "$timer"; fi
 done
-for unit in loxone-local-silver.service loxone-silver-publish.service; do
+for unit in loxone-local-silver.service loxone-silver-publish.service loxone-bronze-archive.service; do
   while [[ "$(systemctl show "$unit" -p ActiveState --value)" =~ ^(active|activating|deactivating|reloading)$ ]]; do sleep 2; done
 done
 for unit in "${units[@]}"; do
@@ -36,7 +37,7 @@ restore() {
   [[ "$code" -eq 0 ]] && return
   set +e
   for timer in "${timers[@]}"; do systemctl stop "$timer"; done
-  systemctl stop loxone-local-silver.service loxone-silver-publish.service
+  systemctl stop loxone-local-silver.service loxone-silver-publish.service loxone-bronze-archive.service
   if [[ -d "$previous" ]]; then ln -sfn "$previous" "$base/current"; else unlink "$base/current"; fi
   for unit in "${units[@]}"; do
     if [[ -f "$backup/$unit" ]]; then cp -a "$backup/$unit" /etc/systemd/system/;
