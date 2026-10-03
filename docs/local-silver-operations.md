@@ -1,14 +1,16 @@
 # Local Silver: Pi computes, MotherDuck serves prepared results
 
 This opt-in pipeline replaces the cloud SQL refresh for this installation. The
-collector and existing Bronze uploader remain in service. No existing cloud
+collector remains in service; the old Bronze uploader can stay disabled in
+local-only mode. No existing cloud
 Silver tables are dropped or repurposed. The ingest account publishes into its
 own `my_db.loxone_silver_local`, distinct from the personal account's `my_db`.
 
 ## Data path and limits
 
-- Collector -> existing SQLite spool -> immutable, date-partitioned Parquet Bronze
-  archive. DuckDB remains the bounded Silver working database.
+- Collector -> existing SQLite spool -> independent immutable, date-partitioned
+  Parquet Bronze archive. The archiver uses an in-memory DuckDB connection to
+  write bounded files; it never opens the persistent Silver working database.
 - Local Python maps structure JSON without duplicating whole control trees in SQL.
   State/details/action/control-key priorities, inherited metadata, temporal
   resolution, ambiguity and late-structure replay follow the existing Silver rules.
@@ -19,11 +21,13 @@ own `my_db.loxone_silver_local`, distinct from the personal account's `my_db`.
   remotely parse Bronze JSON or remap history.
 - MotherDuck still consumes compute for ingestion and queries. An hourly timer
   limits connection frequency; no promise of a fixed compute saving is made.
-- Offline worker has `PrivateNetwork=true`, one DuckDB thread, 96 MB DuckDB memory,
+- Offline Silver worker has `PrivateNetwork=true`, one DuckDB thread, 96 MB DuckDB memory,
   240 MiB process limit, no swap, 75% of one CPU and low priority. Publisher and
-  worker share a local resource lock. Bronze is not stopped for local refreshes.
+  worker share a local resource lock. The archiver has its own lock, 180 MiB
+  process limit, no swap, 50% of one CPU and idle I/O priority. It can run while
+  Silver is stopped. Bronze collection is not stopped for local refreshes.
 - Work is message-bounded, not event-bounded: one reconnect can contain many states.
-  SQLite/DuckDB commits and a hard service timeout make retry safe. Free space below
+  SQLite/DuckDB commits and hard service timeouts make retries safe. Free space below
   2 GiB stops new archival. Monitor failures and growth; disk is not an infinite archive.
 - Local data lives at `/srv/raspi-data/loxone-silver/silver.duckdb`,
   `motherduck-bronze/` and `outbox/`. `loxone_bronze.parquet_ws_messages` and
@@ -48,7 +52,8 @@ for this pipeline, not the exact MotherDuck Bronze ingestion time.
 ## Retention and crash recovery
 
 The spool's `local_silver_checkpoints` and `parquet_archive_checkpoints` tables
-form the local retention gate. Local-only pruning requires both the Silver working
+form the local retention gate. The independent archiver updates only the Parquet
+checkpoint and never prunes SQLite rows. Local-only pruning requires both the Silver working
 copy and the checksummed Parquet file to have acknowledged a row. Parquet files
 are written below `motherduck-bronze/ws_messages/date=YYYY-MM-DD/` and exposed only
 after an atomic rename; an adjacent manifest records row count, time bounds and
@@ -91,12 +96,18 @@ before the local retention gate is created.
 1. Review/merge this change and create `local.enabled` as root. The old
    `loxone-silver-refresh.timer` and service must be stopped.
 2. Run **Deploy Loxone Bronze + Silver** on main. No bridge/sudoers expansion is needed.
-3. Run `sudo systemctl start loxone-local-silver.service` and inspect its summary,
-   result, local event counts and collector health. This performs no cloud calls.
-4. After confirming the ingest token and isolated destination, run
+3. Run `sudo systemctl start loxone-bronze-archive.service` and inspect its
+   summary, Parquet manifests, archive checkpoint and collector health. It does
+   not open the persistent Silver DuckDB or call MotherDuck. Enable
+   `loxone-bronze-archive.timer` after a bounded run succeeds, even when the
+   Silver timer must remain stopped.
+4. Run `sudo systemctl start loxone-local-silver.service` only after its
+   database and resource limits have been validated. Inspect the summary,
+   local event counts and collector health. This performs no cloud calls.
+5. After confirming the ingest token and isolated destination, run
    `sudo systemctl start loxone-silver-publish.service`. Check cloud event/current/
    hourly counts and the batch ledger; retry once to verify no duplicates.
-5. Enable the local and publication timers only after those checks succeed.
+6. Enable the Silver and publication timers only after those checks succeed.
 
 Config: `/etc/loxone-silver/local.env`. Service logs intentionally omit error text
 that might contain credentials. Diagnostic scripts must redact secrets and must
@@ -110,7 +121,7 @@ or transformed when cloud compute is exhausted. Old events preceding all retaine
 structures use the explicitly marked earliest-structure fallback until historical
 structures are imported. Do not present that fallback as proven historical metadata.
 
-Stop both local timers and drain their jobs before changing their release or
+Stop all three local timers and drain their jobs before changing their release or
 restoring files. Keep the retention gate: it prevents data loss while local work is
 paused. The separate cloud SQL timer must remain disabled during this transition.
 Switching code never deletes cloud tables or the local archive.

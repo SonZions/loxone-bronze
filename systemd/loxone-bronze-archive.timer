@@ -1,0 +1,11 @@
+[Unit]
+Description=Archive local Loxone Bronze independently of Silver
+
+[Timer]
+OnBootSec=5min
+OnUnitInactiveSec=30s
+AccuracySec=10s
+Unit=loxone-bronze-archive.service
+
+[Install]
+WantedBy=timers.target
