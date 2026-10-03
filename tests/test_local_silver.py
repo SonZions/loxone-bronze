@@ -1,5 +1,8 @@
 import json
+from datetime import datetime,timedelta,timezone
 from pathlib import Path
+import runpy
+import shutil
 import tempfile
 import threading
 import time
@@ -85,6 +88,23 @@ class LocalSilverTests(unittest.TestCase):
         thread.join(timeout=2)
         self.assertFalse(thread.is_alive())
         self.assertEqual(acquired,[True])
+    def test_archive_index_rebuild_keeps_original_and_repairs_view(self):
+        c,sc=connect_local(self.cfg)
+        try:
+            for name in ('run_id','payload_format','payload_sha256','collector_version'):
+                c.execute(f'ALTER TABLE loxone_bronze.archive_messages ADD COLUMN {name} VARCHAR')
+            c.execute("INSERT INTO loxone_bronze.archive_messages(message_id,source_id,payload_json) VALUES ('old','home','{}')")
+        finally:c.close()
+        backup=self.root/'before-repair.duckdb'
+        shutil.copy2(self.cfg.database,backup)
+        script=runpy.run_path(str(Path(__file__).resolve().parents[1]/'scripts/repair-local-archive-index.py'))
+        script['rebuild'](Path(self.cfg.database),backup,1,'home','blocked')
+        with duckdb.connect(self.cfg.database) as c:
+            self.assertEqual(c.execute('SELECT message_id FROM loxone_bronze.archive_messages').fetchall(),[('old',)])
+            self.assertEqual(c.execute('SELECT message_id FROM loxone_bronze.archive_messages_before_pk_repair').fetchall(),[('old',)])
+            c.execute("INSERT INTO process_queue VALUES ('home','old')")
+            self.assertEqual(c.execute('SELECT message_id FROM loxone_bronze.ws_messages').fetchall(),[('old',)])
+            c.execute("INSERT INTO loxone_bronze.archive_messages(message_id,source_id,payload_json) VALUES ('blocked','home','{}')")
     def test_local_only_prune_requires_archive_ack_and_preserves_cloud_status(self):
         self.message();self.message('m2');self.message('m3')
         self.assertEqual(prune_local_archived(self.cfg)['ws_messages'],0)
@@ -106,9 +126,10 @@ class LocalSilverTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):import_spool(c,self.cfg,'ws_messages')
         finally:c.close()
     def test_late_structure_replaces_existing_published_mapping(self):
-        self.message(at='2026-09-03');run(self.cfg)
-        self.structure();run(self.cfg)
-        self.structure('s2','2026-09-02','New meter');run(self.cfg)
+        now=datetime.now(timezone.utc)
+        self.message(at=(now-timedelta(days=1)).isoformat());run(self.cfg)
+        self.structure(at=(now-timedelta(days=3)).isoformat());run(self.cfg)
+        self.structure('s2',(now-timedelta(days=2)).isoformat(),'New meter');run(self.cfg)
         remote=duckdb.connect(str(self.root/'cloud.duckdb'))
         for path in sorted(Path(self.cfg.outbox).glob('*/manifest.json')):
             publish_batch(remote,path.parent,validate_batch(path.parent),'cloud.loxone_silver_local')
