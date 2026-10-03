@@ -1,0 +1,27 @@
+[Unit]
+Description=Archive Loxone collector spool to local Parquet Bronze
+RequiresMountsFor=/srv/raspi-data
+After=loxone-bronze-collector.service
+
+[Service]
+Type=oneshot
+User=loxonebronze
+Group=loxonebronze
+EnvironmentFile=/etc/loxone-silver/local.env
+ExecStart=/opt/loxone-local-silver/current/venv/bin/python -m loxone_bronze.bronze_archive
+WorkingDirectory=/srv/raspi-data/loxone-silver/motherduck-bronze
+TimeoutStartSec=90
+TimeoutStopSec=15
+Nice=19
+IOSchedulingClass=idle
+CPUQuota=50%
+MemoryMax=180M
+MemorySwapMax=0
+UMask=0077
+PrivateNetwork=true
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/srv/raspi-data/loxone-silver/motherduck-bronze /var/lib/loxone-bronze /srv/raspi-data/loxone-bronze
