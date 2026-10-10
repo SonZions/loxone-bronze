@@ -140,7 +140,7 @@ def connect_local(cfg):
     sc=SilverConfig(source_database=db,target_database=db,batch_size=cfg.batch_size)
     initialize(c,sc)
     c.execute('CREATE TABLE IF NOT EXISTS latest_events AS SELECT * FROM loxone_silver.state_events LIMIT 0')
-    refresh_archive_views(c,cfg)
+    refresh_archive_views(c,cfg,only_missing=True)
     return c,sc
 
 
@@ -203,17 +203,24 @@ def _archive_partition(c,cfg,table,rows,partition):
     return final
 
 
-def refresh_archive_views(c,cfg):
+def refresh_archive_views(c,cfg,only_missing=False):
     root=str(Path(cfg.bronze_archive)).replace("'","''")
+    # Binding read_parquet with union_by_name opens every file's footer. The
+    # independent archiver can create thousands of files while Silver is paused.
+    # Existing views retain their glob and discover new files when queried;
+    # normal worker startup must not rebind the entire archive.
+    existing=dict(c.execute("SELECT view_name,sql FROM duckdb_views() WHERE schema_name='loxone_bronze'").fetchall()) if only_missing else {}
+    def needed(name,glob):
+        return not (name in existing and name+'_raw' in existing and glob in existing[name+'_raw'])
     messages=Path(cfg.bronze_archive)/'ws_messages'
     structures=Path(cfg.bronze_archive)/'structures'
-    if any(messages.glob('date=*/*.parquet')):
+    if needed('parquet_ws_messages',root+'/ws_messages/date=*/*.parquet') and any(messages.glob('date=*/*.parquet')):
         columns=','.join(ARCHIVE_COLUMNS['ws_messages'])
         c.execute(f"CREATE OR REPLACE VIEW loxone_bronze.parquet_ws_messages_raw AS SELECT {columns} FROM read_parquet('{root}/ws_messages/date=*/*.parquet',union_by_name=true,hive_partitioning=true)")
         c.execute(f'''CREATE OR REPLACE VIEW loxone_bronze.parquet_ws_messages AS
           SELECT {columns} FROM loxone_bronze.parquet_ws_messages_raw
           QUALIFY row_number() OVER(PARTITION BY source_id,message_id ORDER BY ingested_at DESC)=1''')
-    if any(structures.glob('*.parquet')):
+    if needed('parquet_structures',root+'/structures/*.parquet') and any(structures.glob('*.parquet')):
         columns=','.join(ARCHIVE_COLUMNS['structures'])
         c.execute(f"CREATE OR REPLACE VIEW loxone_bronze.parquet_structures_raw AS SELECT {columns} FROM read_parquet('{root}/structures/*.parquet',union_by_name=true)")
         c.execute(f'''CREATE OR REPLACE VIEW loxone_bronze.parquet_structures AS
@@ -393,6 +400,8 @@ def process_local_batch(c,sc,cfg):
             FROM {sc.silver}.state_events e SEMI JOIN
             (SELECT DISTINCT source_id,state_uuid,date_trunc('hour',received_at) AS hour_utc FROM {sc.silver}._refresh_events) k
             ON e.source_id=k.source_id AND e.state_uuid=k.state_uuid AND date_trunc('hour',e.received_at)=k.hour_utc
+            WHERE e.received_at >= (SELECT min(date_trunc('hour',received_at)) FROM {sc.silver}._refresh_events)
+              AND e.received_at < (SELECT max(date_trunc('hour',received_at))+INTERVAL '1 hour' FROM {sc.silver}._refresh_events)
             GROUP BY e.source_id,e.state_uuid,date_trunc('hour',received_at)'''}
         files={}
         for name,query in queries.items():

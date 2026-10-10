@@ -85,6 +85,23 @@ copies are removed; local archived Bronze and Silver remain.
 
 ## Deployment and activation
 
+Before starting Silver on a small Pi, check that `memory` appears in
+`/sys/fs/cgroup/cgroup.controllers`. A configured systemd `MemoryMax` does not
+protect the host when the kernel memory controller is disabled. On current
+Raspberry Pi kernels, append `cgroup_enable=memory` to the single line in
+`/boot/firmware/cmdline.txt`, after backing up that file, and perform a controlled
+reboot. Verify the controller and a running service's numeric `MemoryCurrent`
+afterwards. A reboot interrupts the collector and other Pi services.
+
+Normal Silver startup reuses existing Parquet archive views instead of opening
+every archived file's footer. Their stored globs still discover newly archived
+files when queried. Explicit archival/view refreshes can still be expensive.
+Event mapping considers only the structure versions needed by the current batch;
+hourly aggregation restricts scans to the complete hours touched by that batch.
+These changes do not guarantee that a large historical backlog can be processed
+fast enough on a 1 GB Pi. Validate individual runs under effective CPU/memory
+limits before enabling timers, and compare throughput with incoming traffic.
+
 The existing GitHub workflow and bridge v3 remain the deployment path. A root-owned
 `/etc/loxone-silver/local.enabled` marker opts into the local installer after the
 normal Silver installation. The root installer links the immutable release at

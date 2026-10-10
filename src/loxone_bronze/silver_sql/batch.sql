@@ -35,6 +35,7 @@ WITH meanings AS (
            control_name, control_type, room_uuid, room_name, category_uuid, category_name,
            mapping_source, mapping_priority
     FROM ${silver}.state_uuid_map
+    WHERE structure_id IN (SELECT structure_id FROM ${silver}._refresh_batch)
 ), best AS (
     SELECT * FROM meanings
     QUALIFY mapping_priority = min(mapping_priority) OVER (PARTITION BY structure_id,state_uuid)

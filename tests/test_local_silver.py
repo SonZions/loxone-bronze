@@ -62,6 +62,21 @@ class LocalSilverTests(unittest.TestCase):
         self.message('m4')
         with self.spool.connect() as src:
             self.assertEqual(src.execute("SELECT rowid FROM ws_messages WHERE message_id='m4'").fetchone()[0],4)
+
+    def test_hourly_refresh_includes_prior_batch_with_out_of_order_events(self):
+        self.structure()
+        self.cfg.batch_size=1;self.cfg.max_batches=1
+        self.message('m1',3,'2026-09-01T00:20:00+00:00')
+        self.message('m2',1,'2026-09-01T00:10:00+00:00')
+        self.message('m3',9,'2026-09-01T01:00:00+00:00')
+        run(self.cfg);run(self.cfg)
+        directories=sorted(Path(self.cfg.outbox).glob('*/manifest.json'))
+        c=duckdb.connect()
+        try:
+            row=c.execute('SELECT event_count,numeric_min,numeric_max,numeric_avg,numeric_first,numeric_last FROM read_parquet(?)',
+                [str(directories[-1].parent/'hourly_state.parquet')]).fetchone()
+            self.assertEqual(row,(2,1,3,2,1,3))
+        finally:c.close()
     def test_import_skips_message_already_restored_from_cloud_history(self):
         self.message('old',value=7)
         self.message('new',value=8)
@@ -226,6 +241,19 @@ class LocalSilverTests(unittest.TestCase):
             row=c.execute('''SELECT run_id,payload_format,payload_sha256,collector_version
               FROM loxone_bronze.parquet_ws_messages''').fetchone()
             self.assertEqual(row,('r','json','h','test'))
+        finally:c.close()
+
+    def test_reconnect_reuses_archive_views_and_sees_new_partitions(self):
+        self.structure();self.message()
+        archive_run(ArchiveConfig(self.cfg.spool,self.cfg.bronze_archive,min_free_mb=0))
+        c,_=connect_local(self.cfg);c.close()
+        self.message('m2',at='2026-09-02T00:00:00+00:00')
+        archive_run(ArchiveConfig(self.cfg.spool,self.cfg.bronze_archive,min_free_mb=0))
+        with patch.object(Path,'glob',side_effect=AssertionError('Worker startup enumerated the archive')):
+            c,_=connect_local(self.cfg)
+        try:
+            self.assertEqual(c.execute('SELECT count(*) FROM loxone_bronze.parquet_ws_messages').fetchone()[0],2)
+            self.assertEqual(c.execute('SELECT count(*) FROM loxone_bronze.parquet_structures').fetchone()[0],1)
         finally:c.close()
 
     def test_working_bronze_is_pruned_only_after_processing_and_parquet(self):
