@@ -77,6 +77,19 @@ class LocalSilverTests(unittest.TestCase):
                 [str(directories[-1].parent/'hourly_state.parquet')]).fetchone()
             self.assertEqual(row,(2,1,3,2,1,3))
         finally:c.close()
+
+    def test_queue_processes_oldest_receipt_and_acknowledges_same_slice(self):
+        self.structure();self.cfg.batch_size=1;self.cfg.max_batches=1
+        self.message('a-new',3,'2026-09-02T00:00:00+00:00')
+        self.message('z-old',1,'2026-09-01T00:00:00+00:00')
+        run(self.cfg)
+        with duckdb.connect(self.cfg.database) as c:
+            self.assertEqual(c.execute('SELECT message_id FROM process_queue').fetchall(),[('a-new',)])
+            self.assertEqual(c.execute('SELECT message_id FROM loxone_silver.processed_messages').fetchall(),[('z-old',)])
+        run(self.cfg)
+        with duckdb.connect(self.cfg.database) as c:
+            self.assertEqual(c.execute('SELECT count(*) FROM process_queue').fetchone()[0],0)
+            self.assertEqual(c.execute('SELECT value_numeric FROM latest_events').fetchone()[0],3)
     def test_import_skips_message_already_restored_from_cloud_history(self):
         self.message('old',value=7)
         self.message('new',value=8)

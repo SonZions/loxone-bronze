@@ -108,6 +108,15 @@ def prune_local_archived(cfg,limit=5000):
     return deleted
 
 
+def queue_slice(cfg):
+    # UUID ordering scatters a small batch over many historical hours. Keep the
+    # view and its acknowledgement slice identical, and process oldest receipts
+    # first so hourly scans can prune unrelated time ranges.
+    return f'''SELECT q.source_id,q.message_id FROM process_queue q
+      JOIN loxone_bronze.archive_messages a USING(source_id,message_id)
+      ORDER BY a.received_at,q.source_id,q.message_id LIMIT {cfg.batch_size}'''
+
+
 def connect_local(cfg):
     cfg.validate()
     Path(cfg.database).parent.mkdir(parents=True,exist_ok=True)
@@ -134,7 +143,7 @@ def connect_local(cfg):
     # Only a bounded queue slice participates in event transformation.
     c.execute(f'''CREATE OR REPLACE VIEW loxone_bronze.ws_messages AS SELECT a.*
       FROM loxone_bronze.archive_messages a JOIN
-      (SELECT * FROM process_queue ORDER BY source_id,message_id LIMIT {cfg.batch_size}) q
+      ({queue_slice(cfg)}) q
       USING(source_id,message_id)''')
     db=c.execute('SELECT current_database()').fetchone()[0]
     sc=SilverConfig(source_database=db,target_database=db,batch_size=cfg.batch_size)
@@ -364,7 +373,7 @@ def finalize_outbox(c,cfg):
 
 
 def process_local_batch(c,sc,cfg):
-    c.execute(f'CREATE OR REPLACE TEMP TABLE chosen AS SELECT * FROM process_queue ORDER BY source_id,message_id LIMIT {cfg.batch_size}')
+    c.execute(f'CREATE OR REPLACE TEMP TABLE chosen AS {queue_slice(cfg)}')
     selected=c.execute('SELECT count(*) FROM chosen').fetchone()[0]
     if not selected: return None
     seq=c.execute('SELECT coalesce(max(sequence),0)+1 FROM publication_queue').fetchone()[0]
