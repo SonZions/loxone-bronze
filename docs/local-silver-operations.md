@@ -129,6 +129,22 @@ These changes do not guarantee that a large historical backlog can be processed
 fast enough on a 1 GB Pi. Validate individual runs under effective CPU/memory
 limits before enabling timers, and compare throughput with incoming traffic.
 
+For a Pi 3 with effective memory cgroups, the optional
+`config/local-silver-pi3.env.example` profile uses 250 imported/selected messages,
+80 MB DuckDB memory and exactly one batch per process. Merge its values into the
+existing configuration, preserving paths and checkpoints. Multiple batches in
+one process can succeed initially and then exhaust the internal memory budget;
+reopening the connection alone does not release all native allocations. Install
+`systemd/loxone-local-silver-pi3.service.conf` as a service drop-in and
+`systemd/loxone-local-silver-pi3.timer.conf` as a timer drop-in, then reload
+systemd. They cap the service at 200 MiB, disable swap, allow half of one CPU
+core, check the memory controller, enforce a 120-second hard timeout and pause
+ten seconds after each process. The 30-second application budget is checked
+between batches and does not interrupt an individual batch. Do not activate
+the timer until individual runs pass; observe repeated runs and collector
+freshness before enabling it across reboots. The profile does not enable pruning
+or publication.
+
 The existing GitHub workflow and bridge v3 remain the deployment path. A root-owned
 `/etc/loxone-silver/local.enabled` marker opts into the local installer after the
 normal Silver installation. The root installer links the immutable release at
