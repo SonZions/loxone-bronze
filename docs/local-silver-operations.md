@@ -145,6 +145,20 @@ the timer until individual runs pass; observe repeated runs and collector
 freshness before enabling it across reboots. The profile does not enable pruning
 or publication.
 
+For the separate publisher, the optional
+`systemd/loxone-silver-publish-pi3.service.conf` drop-in sets a 240 MiB hard
+limit, no swap, a quarter of one CPU core and a four-minute hard timeout.
+It bounds each invocation to 20 prepared batches using `/usr/bin/env` in
+`ExecStart`: systemd `EnvironmentFile` values override `Environment` values,
+so a batch limit set only with `Environment=` may not take effect. The companion
+`systemd/loxone-silver-publish-pi3.timer.conf` waits five minutes after completion.
+The pipeline lock serializes publication with local computation. Validate
+publication, cloud ledger acknowledgements and duplicate-free retries before
+enabling this timer. For an exact file-to-cloud comparison, pause the local
+Silver timer and drain its current job: the next local job normally deletes
+Parquet files for acknowledged batches. Resume the local timer after checking.
+Keep credentials in the existing protected environment file.
+
 The existing GitHub workflow and bridge v3 remain the deployment path. A root-owned
 `/etc/loxone-silver/local.enabled` marker opts into the local installer after the
 normal Silver installation. The root installer links the immutable release at
