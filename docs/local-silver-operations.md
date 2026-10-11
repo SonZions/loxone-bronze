@@ -103,6 +103,12 @@ slice. Its ledger lookup is materialized for the selected keys, avoiding a large
 correlated hash table over all processed history. Committed spool imports close
 and reopen their DuckDB connection before event transformation to release index
 buffers; a failed reopen leaves the committed rows queued for the next run.
+The chosen raw slice is also materialized, with receipt bounds, before JSON
+predicates run. This prevents predicates pushed through a view from parsing all
+historical raw payloads. Newly transformed rows carry their explicit transaction
+load timestamp and feed the latest-state update and event transport directly;
+those steps do not reread the entire persistent event history. Hourly refreshes
+still include previously processed events from the touched hours.
 
 New local raw working archives have no primary-key ART index. The worker holds
 both pipeline locks and excludes already archived keys inside the import

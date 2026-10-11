@@ -112,7 +112,7 @@ def queue_slice(cfg):
     # UUID ordering scatters a small batch over many historical hours. Keep the
     # view and its acknowledgement slice identical, and process oldest receipts
     # first so hourly scans can prune unrelated time ranges.
-    return f'''SELECT q.source_id,q.message_id FROM process_queue q
+    return f'''SELECT q.source_id,q.message_id,a.received_at FROM process_queue q
       JOIN loxone_bronze.archive_messages a USING(source_id,message_id)
       ORDER BY a.received_at,q.source_id,q.message_id LIMIT {cfg.batch_size}'''
 
@@ -388,24 +388,31 @@ def process_local_batch(c,sc,cfg):
     directory.mkdir(mode=0o700)
     c.execute('BEGIN')
     try:
+        # A view allows JSON predicates to move ahead of the queue join and
+        # parse all historical payloads. Materialize the raw slice first; the
+        # receipt bounds also let column storage skip unrelated row groups.
+        c.execute('''CREATE OR REPLACE TEMP TABLE local_ws_messages AS
+          SELECT a.* FROM loxone_bronze.archive_messages a JOIN chosen q USING(source_id,message_id)
+          WHERE a.received_at >= (SELECT min(received_at) FROM chosen)
+            AND a.received_at <= (SELECT max(received_at) FROM chosen)''')
         # The correlated structure comparison otherwise builds a hash table
         # for the entire historical ledger. Only these keys can participate.
         c.execute(f'''CREATE OR REPLACE TEMP TABLE local_processed_messages AS
           SELECT p.source_id,p.message_id,p.structure_id FROM {sc.silver}.processed_messages p
           SEMI JOIN chosen q USING(source_id,message_id)''')
-        sql=sc.sql('batch.sql',processed_messages='local_processed_messages')
+        sql=sc.sql('batch.sql',processed_messages='local_processed_messages',ws_messages='local_ws_messages')
         c.execute(sql)
         events=c.execute(f'SELECT count(*) FROM {sc.silver}._refresh_events').fetchone()[0]
         c.execute(f'''CREATE OR REPLACE TEMP TABLE next_latest AS
           SELECT * FROM (SELECT * FROM latest_events UNION ALL
-            SELECT * FROM {sc.silver}.state_events e SEMI JOIN {sc.silver}._refresh_batch b USING(source_id,message_id))
+            SELECT * FROM {sc.silver}._refresh_events)
           QUALIFY row_number() OVER(PARTITION BY source_id,state_uuid ORDER BY received_at DESC,message_id DESC,loaded_at DESC)=1''')
         c.execute('DELETE FROM latest_events')
         c.execute('INSERT INTO latest_events SELECT * FROM next_latest')
         c.execute('DELETE FROM process_queue USING chosen q WHERE process_queue.source_id=q.source_id AND process_queue.message_id=q.message_id')
         queries={
           'messages':f'SELECT source_id,message_id FROM {sc.silver}._refresh_batch',
-          'state_events':f'SELECT e.* FROM {sc.silver}.state_events e SEMI JOIN {sc.silver}._refresh_batch b USING(source_id,message_id)',
+          'state_events':f'SELECT * FROM {sc.silver}._refresh_events',
           'current_state':f'''SELECT source_id,state_uuid,state_name,control_uuid,control_name,control_type,room_uuid,room_name,
             category_uuid,category_name,received_at AS last_received_at,received_at_berlin AS last_received_at_berlin,
             value_numeric,value_text,value_json,structure_id,resolution_status FROM latest_events

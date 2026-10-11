@@ -78,6 +78,16 @@ class LocalSilverTests(unittest.TestCase):
             self.assertEqual(row,(2,1,3,2,1,3))
         finally:c.close()
 
+    def test_transport_events_match_persisted_rows_including_load_timestamp(self):
+        self.structure();self.message('m1',1);self.message('m2',3,'2026-09-01T00:20:00+00:00')
+        run(self.cfg)
+        directory=next(Path(self.cfg.outbox).glob('*/manifest.json')).parent
+        with duckdb.connect(self.cfg.database) as c:
+            stored=c.execute('SELECT * FROM loxone_silver.state_events ORDER BY message_id').fetchall()
+            exported=c.execute('SELECT * FROM read_parquet(?) ORDER BY message_id',[str(directory/'state_events.parquet')]).fetchall()
+            self.assertEqual(exported,stored)
+            self.assertIsNotNone(stored[0][-1])
+
     def test_queue_processes_oldest_receipt_and_acknowledges_same_slice(self):
         self.structure();self.cfg.batch_size=1;self.cfg.max_batches=1
         self.message('a-new',3,'2026-09-02T00:00:00+00:00')
