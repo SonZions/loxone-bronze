@@ -151,7 +151,10 @@ limit, no swap, a quarter of one CPU core and a four-minute hard timeout.
 It bounds each invocation to 20 prepared batches using `/usr/bin/env` in
 `ExecStart`: systemd `EnvironmentFile` values override `Environment` values,
 so a batch limit set only with `Environment=` may not take effect. The companion
-`systemd/loxone-silver-publish-pi3.timer.conf` waits five minutes after completion.
+`systemd/loxone-silver-publish-pi3.timer.conf` waits five minutes after completion
+and retains a 15-minute boot trigger after resetting the monotonic timer list.
+Install it with a name that sorts after existing timer drop-ins, such as
+`zz-bounded-cadence.conf`, so an older override cannot replace its cadence.
 The pipeline lock serializes publication with local computation. Validate
 publication, cloud ledger acknowledgements and duplicate-free retries before
 enabling this timer. For an exact file-to-cloud comparison, pause the local
