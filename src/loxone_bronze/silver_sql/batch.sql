@@ -22,7 +22,7 @@ WITH versions AS (
 )
 SELECT d.* FROM desired d
 WHERE NOT EXISTS (
-    SELECT 1 FROM ${silver}.processed_messages p
+    SELECT 1 FROM ${processed_messages} p
     WHERE p.source_id=d.source_id AND p.message_id=d.message_id
       AND p.structure_id IS NOT DISTINCT FROM d.structure_id
 )

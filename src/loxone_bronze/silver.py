@@ -55,9 +55,12 @@ class SilverConfig:
         return cls(**{name: type(default)(os.environ.get("SILVER_" + name.upper(), default))
                       for name, default in cls().__dict__.items()})
 
-    def sql(self, name):
+    def sql(self, name, *, processed_messages=None):
+        ledger=(identifier(processed_messages) if processed_messages is not None
+                else f'{self.silver}.processed_messages')
         return ((SQL_DIR / name).read_text().replace("${bronze}", self.bronze)
-                .replace("${silver}", self.silver).replace("${batch_size}", str(self.batch_size)))
+                .replace("${silver}", self.silver).replace("${batch_size}", str(self.batch_size))
+                .replace("${processed_messages}",ledger))
 
 
 def preflight(con, cfg):

@@ -98,6 +98,27 @@ every archived file's footer. Their stored globs still discover newly archived
 files when queried. Explicit archival/view refreshes can still be expensive.
 Event mapping considers only the structure versions needed by the current batch;
 hourly aggregation restricts scans to the complete hours touched by that batch.
+The local queue selects oldest receipts first and acknowledges exactly that same
+slice. Its ledger lookup is materialized for the selected keys, avoiding a large
+correlated hash table over all processed history. Committed spool imports close
+and reopen their DuckDB connection before event transformation to release index
+buffers; a failed reopen leaves the committed rows queued for the next run.
+
+New local raw working archives have no primary-key ART index. The worker holds
+both pipeline locks and excludes already archived keys inside the import
+transaction; the SQLite spool supplies unique message IDs. This avoids keeping a
+large, non-spillable raw-key index in RAM. Existing indexed archives require an
+explicit one-time migration with `scripts/retire-local-archive-index.py`, stopped
+Silver timers, and effective CPU/RAM/I/O limits. Pass the verified row count with
+`--expected-rows` and the existing file with `--database`. The script streams a
+constraint-free copy, checks counts, column names/types and unchanged import
+cursors, then atomically swaps names and restores the working view. It retains
+the entire original table as `archive_messages_before_index_retirement` and
+refuses to overwrite an earlier migration. It does not delete spool or event
+data. Keep the existing independent backup as well. A failed COMMIT may already
+have ended the transaction; error handling preserves its original cause rather
+than masking it with a second rollback error.
+
 These changes do not guarantee that a large historical backlog can be processed
 fast enough on a 1 GB Pi. Validate individual runs under effective CPU/memory
 limits before enabling timers, and compare throughput with incoming traffic.

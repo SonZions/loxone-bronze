@@ -90,6 +90,86 @@ class LocalSilverTests(unittest.TestCase):
         with duckdb.connect(self.cfg.database) as c:
             self.assertEqual(c.execute('SELECT count(*) FROM process_queue').fetchone()[0],0)
             self.assertEqual(c.execute('SELECT value_numeric FROM latest_events').fetchone()[0],3)
+
+    def test_reopen_failure_after_import_resumes_without_losing_or_duplicating_rows(self):
+        self.structure();self.message('m1');self.message('m2',2)
+        connections=0
+        def reopen(cfg):
+            nonlocal connections
+            connections+=1
+            if connections==2:raise RuntimeError('Simulated reopen failure')
+            return connect_local(cfg)
+        with patch('loxone_bronze.local_silver.connect_local',side_effect=reopen):
+            with self.assertRaisesRegex(RuntimeError,'Simulated reopen failure'):run(self.cfg)
+        with duckdb.connect(self.cfg.database) as c:
+            self.assertEqual(c.execute('SELECT count(*) FROM process_queue').fetchone()[0],2)
+            self.assertEqual(c.execute('SELECT count(*) FROM loxone_silver.state_events').fetchone()[0],0)
+        with self.spool.connect() as c:
+            self.assertEqual(c.execute("SELECT rowid_highwater FROM local_silver_checkpoints WHERE table_name='ws_messages'").fetchone()[0],2)
+        run(self.cfg);run(self.cfg)
+        with duckdb.connect(self.cfg.database) as c:
+            self.assertEqual(c.execute('SELECT count(*) FROM loxone_bronze.archive_messages').fetchone()[0],2)
+            self.assertEqual(c.execute('SELECT count(*) FROM loxone_silver.state_events').fetchone()[0],2)
+            self.assertEqual(c.execute('SELECT count(*) FROM process_queue').fetchone()[0],0)
+
+    def test_bounded_ledger_replays_late_structure_and_ignores_other_source(self):
+        self.structure();self.message('m1',7,'2026-09-03T00:00:00+00:00')
+        run(self.cfg)
+        with duckdb.connect(self.cfg.database) as c:
+            c.execute("INSERT INTO loxone_silver.processed_messages(source_id,message_id,structure_id) VALUES ('other','m2','s1')")
+        self.structure('s2','2026-09-02','Updated meter')
+        self.message('m2',9,'2026-09-03T00:10:00+00:00')
+        run(self.cfg);run(self.cfg)
+        with duckdb.connect(self.cfg.database) as c:
+            self.assertEqual(c.execute('SELECT message_id,control_name,value_numeric FROM loxone_silver.state_events ORDER BY message_id').fetchall(),
+                [('m1','Updated meter',7),('m2','Updated meter',9)])
+            self.assertEqual(c.execute("SELECT message_id,structure_id FROM loxone_silver.processed_messages WHERE source_id='home' ORDER BY message_id").fetchall(),
+                [('m1','s2'),('m2','s2')])
+            self.assertEqual(c.execute('SELECT count(*) FROM process_queue').fetchone()[0],0)
+
+    def test_index_retirement_preserves_rows_cursors_and_replay(self):
+        self.structure();self.message('m1',7)
+        c,sc=connect_local(self.cfg)
+        try:
+            c.execute('ALTER TABLE loxone_bronze.archive_messages ADD PRIMARY KEY(source_id,message_id)')
+            import_spool(c,self.cfg,'structures');import_spool(c,self.cfg,'ws_messages')
+            before=c.execute('SELECT * FROM loxone_bronze.archive_messages ORDER BY ALL').fetchall()
+            cursors=c.execute('SELECT * FROM import_progress ORDER BY table_name').fetchall()
+        finally:c.close()
+        script=runpy.run_path(str(Path(__file__).resolve().parents[1]/'scripts/retire-local-archive-index.py'))
+        script['retire'](Path(self.cfg.database),1)
+        c,sc=connect_local(self.cfg)
+        try:
+            self.assertEqual(c.execute("SELECT count(*) FROM duckdb_constraints() WHERE schema_name='loxone_bronze' AND table_name='archive_messages' AND constraint_type='PRIMARY KEY'").fetchone()[0],0)
+            self.assertEqual(c.execute('SELECT * FROM loxone_bronze.archive_messages ORDER BY ALL').fetchall(),before)
+            self.assertEqual(c.execute('SELECT * FROM loxone_bronze.archive_messages_before_index_retirement ORDER BY ALL').fetchall(),before)
+            self.assertEqual(c.execute('SELECT * FROM import_progress ORDER BY table_name').fetchall(),cursors)
+            c.execute("UPDATE import_progress SET rowid_highwater=0 WHERE table_name='ws_messages'")
+            with self.spool.connect() as src:src.execute("UPDATE local_silver_checkpoints SET rowid_highwater=0 WHERE table_name='ws_messages'")
+            import_spool(c,self.cfg,'ws_messages')
+            self.assertEqual(c.execute('SELECT count(*) FROM loxone_bronze.archive_messages').fetchone()[0],1)
+        finally:c.close()
+        run(self.cfg)
+        with duckdb.connect(self.cfg.database) as c:
+            self.assertEqual(c.execute('SELECT value_numeric FROM loxone_silver.state_events').fetchall(),[(7,)])
+
+    def test_failed_commit_preserves_cause_and_does_not_acknowledge_spool(self):
+        self.message()
+        c,sc=connect_local(self.cfg)
+        class FailedCommit:
+            def execute(self,sql,*args):
+                if sql=='COMMIT':
+                    c.execute('ROLLBACK')
+                    raise duckdb.TransactionException('Original commit failure')
+                return c.execute(sql,*args)
+        try:
+            with self.assertRaisesRegex(duckdb.TransactionException,'Original commit failure'):
+                import_spool(FailedCommit(),self.cfg,'ws_messages')
+            self.assertEqual(c.execute('SELECT count(*) FROM loxone_bronze.archive_messages').fetchone()[0],0)
+            self.assertEqual(c.execute('SELECT count(*) FROM import_progress').fetchone()[0],0)
+            with self.spool.connect() as src:
+                self.assertEqual(src.execute("SELECT rowid_highwater FROM local_silver_checkpoints WHERE table_name='ws_messages'").fetchone()[0],0)
+        finally:c.close()
     def test_import_skips_message_already_restored_from_cloud_history(self):
         self.message('old',value=7)
         self.message('new',value=8)

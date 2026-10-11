@@ -130,7 +130,7 @@ def connect_local(cfg):
     c.execute('CREATE SCHEMA IF NOT EXISTS loxone_bronze')
     c.execute('''CREATE TABLE IF NOT EXISTS loxone_bronze.archive_messages(
       message_id VARCHAR,source_id VARCHAR,received_at TIMESTAMPTZ,message_type INTEGER,
-      ingested_at TIMESTAMPTZ,payload_json JSON,PRIMARY KEY(source_id,message_id))''')
+      ingested_at TIMESTAMPTZ,payload_json JSON)''')
     c.execute('''CREATE TABLE IF NOT EXISTS loxone_bronze.structures(
       structure_id VARCHAR PRIMARY KEY,source_id VARCHAR,captured_at TIMESTAMPTZ,
       last_modified VARCHAR,payload_json JSON,payload_sha256 VARCHAR,
@@ -331,7 +331,10 @@ def import_spool(c,cfg,table):
         c.execute('INSERT OR REPLACE INTO import_progress VALUES (?,?)',[table,cursor])
         c.execute('COMMIT')
     except BaseException:
-        c.execute('ROLLBACK'); raise
+        # DuckDB can already have aborted a failed COMMIT. Preserve its cause.
+        try:c.execute('ROLLBACK')
+        except duckdb.TransactionException:pass
+        raise
     # A failure here safely repeats the idempotent import. Never acknowledge first.
     with spool_connection(cfg.spool) as src:
         src.execute('UPDATE local_silver_checkpoints SET rowid_highwater=? WHERE table_name=?',(cursor,table))
@@ -385,7 +388,12 @@ def process_local_batch(c,sc,cfg):
     directory.mkdir(mode=0o700)
     c.execute('BEGIN')
     try:
-        sql=sc.sql('batch.sql')
+        # The correlated structure comparison otherwise builds a hash table
+        # for the entire historical ledger. Only these keys can participate.
+        c.execute(f'''CREATE OR REPLACE TEMP TABLE local_processed_messages AS
+          SELECT p.source_id,p.message_id,p.structure_id FROM {sc.silver}.processed_messages p
+          SEMI JOIN chosen q USING(source_id,message_id)''')
+        sql=sc.sql('batch.sql',processed_messages='local_processed_messages')
         c.execute(sql)
         events=c.execute(f'SELECT count(*) FROM {sc.silver}._refresh_events').fetchone()[0]
         c.execute(f'''CREATE OR REPLACE TEMP TABLE next_latest AS
@@ -426,7 +434,9 @@ def process_local_batch(c,sc,cfg):
         c.execute(f'DROP TABLE {sc.silver}._refresh_events')
         c.execute('COMMIT')
     except BaseException:
-        c.execute('ROLLBACK'); raise
+        try:c.execute('ROLLBACK')
+        except duckdb.TransactionException:pass
+        raise
     finalize_outbox(c,cfg)
     return {'messages':selected,'events':events,'sequence':seq}
 
@@ -450,7 +460,15 @@ def run(cfg):
                 unmapped=c.execute('SELECT 1 FROM loxone_bronze.structures b WHERE NOT EXISTS(SELECT 1 FROM mapped_structure_inputs m WHERE m.structure_id=b.structure_id) LIMIT 1').fetchone()
                 if more or unmapped: continue
                 pending=c.execute('SELECT count(*) FROM process_queue').fetchone()[0]
-                if pending < cfg.import_size: imported+=import_spool(c,cfg,'ws_messages')
+                if pending < cfg.import_size:
+                    received=import_spool(c,cfg,'ws_messages')
+                    imported+=received
+                    if received:
+                        # Imports commit before their SQLite acknowledgement.
+                        # Release the non-spillable primary-key index buffers
+                        # before transforming events under the same RAM cap.
+                        c.close()
+                        c,sc=connect_local(cfg)
                 result=process_local_batch(c,sc,cfg)
                 if result: batches.append(result); LOG.info('local_batch %s',json.dumps(result))
                 else: break
