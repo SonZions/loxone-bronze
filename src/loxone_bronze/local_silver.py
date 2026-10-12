@@ -112,9 +112,8 @@ def queue_slice(cfg):
     # UUID ordering scatters a small batch over many historical hours. Keep the
     # view and its acknowledgement slice identical, and process oldest receipts
     # first so hourly scans can prune unrelated time ranges.
-    return f'''SELECT q.source_id,q.message_id,a.received_at FROM process_queue q
-      JOIN loxone_bronze.archive_messages a USING(source_id,message_id)
-      ORDER BY a.received_at,q.source_id,q.message_id LIMIT {cfg.batch_size}'''
+    return f'''SELECT source_id,message_id,received_at FROM process_queue
+      ORDER BY received_at,source_id,message_id LIMIT {cfg.batch_size}'''
 
 
 def connect_local(cfg):
@@ -136,7 +135,10 @@ def connect_local(cfg):
       last_modified VARCHAR,payload_json JSON,payload_sha256 VARCHAR,
       collector_version VARCHAR,ingested_at TIMESTAMPTZ)''')
     c.execute('CREATE TABLE IF NOT EXISTS import_progress(table_name VARCHAR PRIMARY KEY,rowid_highwater BIGINT)')
-    c.execute('CREATE TABLE IF NOT EXISTS process_queue(source_id VARCHAR,message_id VARCHAR,PRIMARY KEY(source_id,message_id))')
+    c.execute('CREATE TABLE IF NOT EXISTS process_queue(source_id VARCHAR,message_id VARCHAR,received_at TIMESTAMPTZ)')
+    if 'received_at' not in [r[0] for r in c.execute('DESCRIBE process_queue').fetchall()]:
+        c.close()
+        raise RuntimeError('Run migrate-local-work-indexes.py before starting the worker')
     c.execute('CREATE TABLE IF NOT EXISTS local_metadata(key VARCHAR PRIMARY KEY,value VARCHAR)')
     c.execute("INSERT OR IGNORE INTO local_metadata VALUES ('pipeline_id',?)",[str(uuid.uuid4())])
     c.execute('CREATE TABLE IF NOT EXISTS publication_queue(sequence BIGINT PRIMARY KEY,status VARCHAR,manifest VARCHAR)')
@@ -147,7 +149,7 @@ def connect_local(cfg):
       USING(source_id,message_id)''')
     db=c.execute('SELECT current_database()').fetchone()[0]
     sc=SilverConfig(source_database=db,target_database=db,batch_size=cfg.batch_size)
-    initialize(c,sc)
+    initialize(c,sc,processed_primary_key=False)
     c.execute('CREATE TABLE IF NOT EXISTS latest_events AS SELECT * FROM loxone_silver.state_events LIMIT 0')
     refresh_archive_views(c,cfg,only_missing=True)
     return c,sc
@@ -265,6 +267,8 @@ def archive_spool(c,cfg,table,refresh_views=True):
 
 def prune_working_archive(c,cfg,limit=5000):
     """Bound DuckDB raw working data only after Parquet has caught up."""
+    remap=dict(c.execute("SELECT key,value FROM local_metadata WHERE key IN ('remap_cursor','remap_target')").fetchall())
+    if int(remap.get('remap_cursor',-1)) < int(remap.get('remap_target',-1)):return 0
     imported=c.execute("SELECT rowid_highwater FROM import_progress WHERE table_name='ws_messages'").fetchone()
     with spool_connection(cfg.spool) as src:
         parquet=src.execute("SELECT rowid_highwater FROM parquet_archive_checkpoints WHERE table_name='ws_messages'").fetchone()
@@ -315,7 +319,9 @@ def import_spool(c,cfg,table):
                     output.write(line)
             c.execute(f"CREATE OR REPLACE TEMP TABLE import_rows AS SELECT * FROM read_json(?,columns={{{schema}}},format='newline_delimited',maximum_object_size={max_record})",[str(path)])
         if table=='ws_messages':
-            c.execute('INSERT OR IGNORE INTO process_queue SELECT source_id,message_id FROM import_rows r WHERE NOT EXISTS(SELECT 1 FROM loxone_bronze.archive_messages a WHERE a.source_id=r.source_id AND a.message_id=r.message_id)')
+            c.execute('''INSERT INTO process_queue SELECT source_id,message_id,received_at FROM import_rows r
+              WHERE NOT EXISTS(SELECT 1 FROM loxone_bronze.archive_messages a WHERE a.source_id=r.source_id AND a.message_id=r.message_id)
+              AND NOT EXISTS(SELECT 1 FROM process_queue q WHERE q.source_id=r.source_id AND q.message_id=r.message_id)''')
         # Cloud-history backfills can already have the same message in the working
         # archive while the SQLite rowid cursor is still behind it. Filter those
         # rows before the insert: DuckDB's conflict handler is not reliable for
@@ -342,16 +348,44 @@ def import_spool(c,cfg,table):
 
 
 def enqueue_remapping(c,sc):
-    # Run only after a new structure was mapped. Unchanged historical events stay put.
-    c.execute(f'''INSERT OR IGNORE INTO process_queue
+    # Called inside the structure transaction. Register a snapshot instead of
+    # building a historical hash join and million-row ART index in that commit.
+    target=c.execute('SELECT coalesce(max(rowid),-1) FROM loxone_bronze.archive_messages').fetchone()[0]
+    c.execute("INSERT OR REPLACE INTO local_metadata VALUES ('remap_cursor','-1'),('remap_target',?)",[str(target)])
+
+
+def scan_remapping(c,sc,cfg):
+    state=dict(c.execute("SELECT key,value FROM local_metadata WHERE key IN ('remap_cursor','remap_target')").fetchall())
+    cursor=int(state.get('remap_cursor',-1));target=int(state.get('remap_target',-1))
+    if cursor>=target:return 0
+    c.execute('''CREATE OR REPLACE TEMP TABLE remap_slice AS
+      SELECT rowid AS scan_rowid,source_id,message_id,received_at FROM loxone_bronze.archive_messages
+      WHERE rowid>? AND rowid<=? ORDER BY rowid LIMIT ?''',[cursor,target,cfg.import_size])
+    end=c.execute('SELECT max(scan_rowid) FROM remap_slice').fetchone()[0]
+    if end is None:end=target
+    c.execute(f'''CREATE OR REPLACE TEMP TABLE remap_ledger AS
+      SELECT p.source_id,p.message_id,p.structure_id FROM {sc.silver}.processed_messages p
+      SEMI JOIN remap_slice b USING(source_id,message_id)''')
+    c.execute(f'''CREATE OR REPLACE TEMP TABLE remap_candidates AS
     WITH v AS (SELECT *,row_number() OVER(PARTITION BY source_id ORDER BY structure_captured_at,structure_id) rn,
       lead(structure_captured_at) OVER(PARTITION BY source_id ORDER BY structure_captured_at,structure_id) valid_to
       FROM {sc.silver}.structure_versions)
-    SELECT b.source_id,b.message_id FROM loxone_bronze.archive_messages b
-    JOIN {sc.silver}.processed_messages p USING(source_id,message_id)
+    SELECT b.source_id,b.message_id,b.received_at FROM remap_slice b
+    JOIN remap_ledger p USING(source_id,message_id)
     LEFT JOIN v ON v.source_id=b.source_id AND (v.rn=1 OR b.received_at>=v.structure_captured_at)
       AND (v.valid_to IS NULL OR b.received_at<v.valid_to)
     WHERE p.structure_id IS DISTINCT FROM v.structure_id''')
+    c.execute('BEGIN')
+    try:
+        c.execute('''INSERT INTO process_queue SELECT b.* FROM remap_candidates b
+          WHERE NOT EXISTS(SELECT 1 FROM process_queue q WHERE q.source_id=b.source_id AND q.message_id=b.message_id)''')
+        c.execute("INSERT OR REPLACE INTO local_metadata VALUES ('remap_cursor',?)",[str(end)])
+        c.execute('COMMIT')
+    except BaseException:
+        try:c.execute('ROLLBACK')
+        except duckdb.TransactionException:pass
+        raise
+    return c.execute('SELECT count(*) FROM remap_slice').fetchone()[0]
 
 
 def sha256(path):
@@ -466,6 +500,7 @@ def run(cfg):
                     more=src.execute('SELECT 1 FROM structures WHERE rowid>? LIMIT 1',(cursor[0] if cursor else 0,)).fetchone()
                 unmapped=c.execute('SELECT 1 FROM loxone_bronze.structures b WHERE NOT EXISTS(SELECT 1 FROM mapped_structure_inputs m WHERE m.structure_id=b.structure_id) LIMIT 1').fetchone()
                 if more or unmapped: continue
+                scanned=scan_remapping(c,sc,cfg)
                 pending=c.execute('SELECT count(*) FROM process_queue').fetchone()[0]
                 if pending < cfg.import_size:
                     received=import_spool(c,cfg,'ws_messages')
@@ -478,7 +513,7 @@ def run(cfg):
                         c,sc=connect_local(cfg)
                 result=process_local_batch(c,sc,cfg)
                 if result: batches.append(result); LOG.info('local_batch %s',json.dumps(result))
-                else: break
+                elif not scanned: break
             pruned=prune_local_archived(cfg) if cfg.prune_local_only else {}
             working_pruned=prune_working_archive(c,cfg)
             summary={'imported':imported,'batches':len(batches),'events':sum(b['events'] for b in batches),

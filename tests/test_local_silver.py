@@ -138,6 +138,53 @@ class LocalSilverTests(unittest.TestCase):
                 [('m1','s2'),('m2','s2')])
             self.assertEqual(c.execute('SELECT count(*) FROM process_queue').fetchone()[0],0)
 
+    def test_work_index_migration_preserves_pending_rows_and_replay(self):
+        self.structure();self.message('m1',7);run(self.cfg)
+        self.message('m2',9)
+        c,sc=connect_local(self.cfg)
+        try:
+            import_spool(c,self.cfg,'ws_messages')
+            c.execute('DROP VIEW loxone_bronze.ws_messages')
+            c.execute('ALTER TABLE process_queue DROP COLUMN received_at')
+            c.execute('ALTER TABLE process_queue ADD PRIMARY KEY(source_id,message_id)')
+            c.execute('ALTER TABLE loxone_silver.processed_messages ADD PRIMARY KEY(source_id,message_id)')
+            ledger=c.execute('SELECT * FROM loxone_silver.processed_messages').fetchall()
+            cursors=c.execute('SELECT * FROM import_progress ORDER BY table_name').fetchall()
+        finally:c.close()
+        with self.assertRaisesRegex(RuntimeError,'migrate-local-work-indexes'):connect_local(self.cfg)
+        script=runpy.run_path(str(Path(__file__).resolve().parents[1]/'scripts/migrate-local-work-indexes.py'))
+        script['migrate'](self.cfg.database,1,1)
+        with duckdb.connect(self.cfg.database) as c:
+            self.assertEqual(c.execute('SELECT * FROM loxone_silver.processed_messages').fetchall(),ledger)
+            self.assertEqual(c.execute('SELECT * FROM import_progress ORDER BY table_name').fetchall(),cursors)
+            self.assertEqual(c.execute('SELECT count(*) FROM process_queue_before_work_migration').fetchone()[0],1)
+            self.assertEqual(c.execute("SELECT count(*) FROM duckdb_constraints() WHERE table_name IN ('process_queue','processed_messages') AND constraint_type='PRIMARY KEY'").fetchone()[0],0)
+        run(self.cfg);run(self.cfg)
+        with duckdb.connect(self.cfg.database) as c:
+            self.assertEqual(c.execute('SELECT count(*) FROM loxone_silver.state_events').fetchone()[0],2)
+            self.assertEqual(c.execute('SELECT count(*) FROM loxone_silver.processed_messages WHERE processed_at IS NOT NULL').fetchone()[0],2)
+
+    def test_remapping_scans_bounded_chunks_and_deduplicates_existing_queue(self):
+        self.structure()
+        for i in range(8):self.message(f'm{i}',i,'2026-09-03T00:00:00+00:00')
+        for _ in range(4):run(self.cfg)
+        self.structure('s2','2026-09-02','Updated meter')
+        c,sc=connect_local(self.cfg)
+        try:
+            import_spool(c,self.cfg,'structures');sync_local_structure(c,sc,enqueue_remapping)
+            self.assertEqual(c.execute('SELECT count(*) FROM process_queue').fetchone()[0],0)
+            self.assertEqual(local_silver_module.scan_remapping(c,sc,self.cfg),3)
+            self.assertEqual(c.execute('SELECT count(*) FROM process_queue').fetchone()[0],3)
+            enqueue_remapping(c,sc)  # restarting the scan must not duplicate work
+            self.assertEqual(local_silver_module.scan_remapping(c,sc,self.cfg),3)
+            self.assertEqual(c.execute('SELECT count(*) FROM process_queue').fetchone()[0],3)
+        finally:c.close()
+        for _ in range(4):run(self.cfg)
+        with duckdb.connect(self.cfg.database) as c:
+            self.assertEqual(c.execute("SELECT count(*) FROM loxone_silver.processed_messages WHERE structure_id='s2'").fetchone()[0],8)
+            self.assertEqual(c.execute('SELECT count(*) FROM loxone_silver.state_events').fetchone()[0],8)
+            self.assertEqual(c.execute('SELECT count(*) FROM process_queue').fetchone()[0],0)
+
     def test_index_retirement_preserves_rows_cursors_and_replay(self):
         self.structure();self.message('m1',7)
         c,sc=connect_local(self.cfg)
@@ -237,7 +284,7 @@ class LocalSilverTests(unittest.TestCase):
         with duckdb.connect(self.cfg.database) as c:
             self.assertEqual(c.execute('SELECT message_id FROM loxone_bronze.archive_messages').fetchall(),[('old',)])
             self.assertEqual(c.execute('SELECT message_id FROM loxone_bronze.archive_messages_before_pk_repair').fetchall(),[('old',)])
-            c.execute("INSERT INTO process_queue VALUES ('home','old')")
+            c.execute("INSERT INTO process_queue VALUES ('home','old',NULL)")
             self.assertEqual(c.execute('SELECT message_id FROM loxone_bronze.ws_messages').fetchall(),[('old',)])
             c.execute("INSERT INTO loxone_bronze.archive_messages(message_id,source_id,payload_json) VALUES ('blocked','home','{}')")
     def test_local_only_prune_requires_archive_ack_and_preserves_cloud_status(self):

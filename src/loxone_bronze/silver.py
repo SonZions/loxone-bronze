@@ -73,12 +73,13 @@ def preflight(con, cfg):
         raise ValueError("Target database is not attached")
 
 
-def initialize(con, cfg):
+def initialize(con, cfg, *, processed_primary_key=True):
     con.execute(cfg.sql("schema.sql"))
     s = cfg.silver
+    key = ', PRIMARY KEY(source_id,message_id)' if processed_primary_key else ''
     con.execute(f"CREATE TABLE IF NOT EXISTS {s}.processed_messages ("
                 "source_id VARCHAR, message_id VARCHAR, structure_id VARCHAR, "
-                "processed_at TIMESTAMPTZ DEFAULT now(), PRIMARY KEY(source_id,message_id))")
+                f"processed_at TIMESTAMPTZ DEFAULT now(){key})")
     con.execute(f"CREATE TABLE IF NOT EXISTS {s}.refresh_guard (id INTEGER PRIMARY KEY, revision BIGINT)")
     con.execute(f"INSERT OR IGNORE INTO {s}.refresh_guard VALUES (1,0)")
 

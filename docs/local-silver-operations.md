@@ -161,6 +161,9 @@ enabling this timer. For an exact file-to-cloud comparison, pause the local
 Silver timer and drain its current job: the next local job normally deletes
 Parquet files for acknowledged batches. Resume the local timer after checking.
 Keep credentials in the existing protected environment file.
+The Pi publisher profile enables Python's fault handler, so a native crash can
+record thread stacks in the journal without dumping local variables or creating
+a full process core. This aids diagnosis; it does not repair a native crash.
 
 The existing GitHub workflow and bridge v3 remain the deployment path. A root-owned
 `/etc/loxone-silver/local.enabled` marker opts into the local installer after the
@@ -201,6 +204,29 @@ that might contain credentials. Diagnostic scripts must redact secrets and must
 not print environment files or token-bearing connection strings.
 
 ## Historical coverage and rollback
+
+Local queues store receipt timestamps directly so selecting a small batch does
+not join the entire queue to the archive. New local queues and processing ledgers
+have no primary-key ART indexes: the exclusive pipeline/database locks and
+transactional import guards and message replacement preserve uniqueness.
+Cloud processing keeps its primary keys. A newly mapped structure registers a
+resumable archive scan; each iteration examines at most `LOCAL_SILVER_IMPORT_SIZE`
+raw rows and queues only messages whose ledger mapping differs. Existing queued
+keys are retained without duplicates. Working-archive pruning waits for this scan.
+
+An existing two-column local queue requires the explicit migration
+`scripts/migrate-local-work-indexes.py --database PATH --expected-queue COUNT
+--expected-ledger COUNT`. Stop the local worker and publisher timers, drain both
+jobs and obtain the current counts first. Run the migration with effective CPU,
+RAM and I/O caps. It verifies queue keys and all ledger columns in both directions,
+preserves import cursors and publication metadata, and swaps table names in one
+transaction. Original tables remain as `process_queue_before_work_migration` and
+`loxone_silver.processed_messages_before_work_migration`. Never drop them as part
+of a trial. A failed pre-swap migration leaves the active tables unchanged and
+refuses to overwrite its shadows on retry; inspect those artifacts first.
+The worker refuses the old queue format until migration succeeds. If an archive
+is rebuilt while a remapping scan is pending, restart the scan with
+`enqueue_remapping` under the same locks, because its scan cursor uses local rowids.
 
 Initial archival starts at the oldest retained local message. Older cloud-only
 Bronze history needs a separate bounded backfill; this is not silently downloaded
