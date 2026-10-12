@@ -9,6 +9,7 @@ import time
 import unittest
 from unittest.mock import patch
 import duckdb
+import loxone_bronze.local_silver as local_silver_module
 from loxone_bronze.spool import Spool
 from loxone_bronze.local_silver import (LocalConfig,enable_retention_guard,connect_local,
     archive_spool,import_spool,run,finalize_outbox,process_local_batch,enqueue_remapping,
@@ -180,6 +181,21 @@ class LocalSilverTests(unittest.TestCase):
             with self.spool.connect() as src:
                 self.assertEqual(src.execute("SELECT rowid_highwater FROM local_silver_checkpoints WHERE table_name='ws_messages'").fetchone()[0],0)
         finally:c.close()
+    def test_main_logs_commit_memory_cause_without_exception_values(self):
+        secret='private-payload-and-token-value'
+        failure=duckdb.TransactionException('Failed to commit: Out of Memory Error: '+secret)
+        with patch('sys.argv',['local_silver']), \
+             patch.object(LocalConfig,'from_env',return_value=self.cfg), \
+             patch.object(local_silver_module,'run',side_effect=failure), \
+             self.assertLogs(local_silver_module.LOG,level='ERROR') as output:
+            with self.assertRaises(SystemExit) as stopped:
+                local_silver_module.main()
+        self.assertEqual(stopped.exception.code,1)
+        self.assertIn('reason=memory_limit operation=commit',output.output[0])
+        self.assertIn('origin=',output.output[0])
+        self.assertNotIn(secret,output.output[0])
+        self.assertEqual(local_silver_module.safe_failure_context(
+            duckdb.ConstraintException(secret))[:2],('other','unknown'))
     def test_import_skips_message_already_restored_from_cloud_history(self):
         self.message('old',value=7)
         self.message('new',value=8)

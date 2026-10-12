@@ -490,6 +490,18 @@ def run(cfg):
         finally: c.close()
 
 
+def safe_failure_context(exc):
+    """Classify failures without logging exception text, SQL or payload values."""
+    message=str(exc).lower()
+    memory=isinstance(exc,duckdb.OutOfMemoryException) or any(term in message for term in
+      ('out of memory','memory limit','memory allocation','failed to allocate','could not allocate','failed to pin'))
+    operation='commit' if isinstance(exc,duckdb.TransactionException) and 'commit' in message else 'unknown'
+    frame=exc.__traceback__
+    while frame and frame.tb_next: frame=frame.tb_next
+    origin=f'{frame.tb_frame.f_code.co_name}:{frame.tb_lineno}' if frame else 'unknown'
+    return ('memory_limit' if memory else 'other',operation,origin)
+
+
 def main():
     p=argparse.ArgumentParser(); p.add_argument('--enable-retention-guard',action='store_true'); args=p.parse_args()
     logging.basicConfig(level=logging.INFO,format='%(asctime)s %(levelname)s %(message)s')
@@ -499,6 +511,9 @@ def main():
         else: run(cfg)
     except BlockingIOError: LOG.info('local_skipped already_running=true')
     except Exception as exc:
-        LOG.error('local_error type=%s',type(exc).__name__); raise SystemExit(1) from None
+        reason,operation,origin=safe_failure_context(exc)
+        LOG.error('local_error type=%s reason=%s operation=%s origin=%s',
+                  type(exc).__name__,reason,operation,origin)
+        raise SystemExit(1) from None
 
 if __name__=='__main__': main()

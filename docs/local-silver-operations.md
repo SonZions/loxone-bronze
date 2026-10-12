@@ -131,7 +131,7 @@ limits before enabling timers, and compare throughput with incoming traffic.
 
 For a Pi 3 with effective memory cgroups, the optional
 `config/local-silver-pi3.env.example` profile uses 250 imported/selected messages,
-80 MB DuckDB memory and exactly one batch per process. Merge its values into the
+96 MB DuckDB memory and exactly one batch per process. Merge its values into the
 existing configuration, preserving paths and checkpoints. Multiple batches in
 one process can succeed initially and then exhaust the internal memory budget;
 reopening the connection alone does not release all native allocations. Install
@@ -186,7 +186,17 @@ before the local retention gate is created.
    hourly counts and the batch ledger; retry once to verify no duplicates.
 6. Enable the Silver and publication timers only after those checks succeed.
 
-Config: `/etc/loxone-silver/local.env`. Service logs intentionally omit error text
+On restart, imports reconcile their committed DuckDB cursor with the SQLite
+acknowledgement. A failed transformation transaction leaves its selected queue
+keys intact; the next invocation reuses its sequence and replaces unpublished
+transport files. A committed queue entry can restore a missing manifest.
+Publication records the same batch IDs in the cloud transaction before local
+ACKs, so retries after a partial acknowledgement do not insert another copy.
+Hourly outputs replace the affected keys rather than incrementing stored counts.
+
+Config: `/etc/loxone-silver/local.env`. Local error logs include a reason category,
+commit phase when recognized and the originating function/line, without logging
+the exception text. Service logs intentionally omit error text
 that might contain credentials. Diagnostic scripts must redact secrets and must
 not print environment files or token-bearing connection strings.
 
