@@ -27,6 +27,30 @@ from .local_mapping import sync_local_structure
 LOG = logging.getLogger(__name__)
 TABLES = ('structures', 'ws_messages')
 
+
+@contextmanager
+def database_phase(name):
+    """Leave a safe phase marker even when systemd interrupts a native call."""
+    started=time.monotonic()
+    LOG.info('local_db_phase_start phase=%s',name)
+    try:
+        yield
+    except BaseException as exc:
+        LOG.warning('local_db_phase_failed phase=%s type=%s elapsed_seconds=%.2f',
+                    name,type(exc).__name__,time.monotonic()-started)
+        raise
+    else:
+        LOG.info('local_db_phase_end phase=%s elapsed_seconds=%.2f',
+                 name,time.monotonic()-started)
+
+
+def commit_local(c,phase):
+    with database_phase('commit_'+phase):c.execute('COMMIT')
+
+
+def close_local(c,phase):
+    with database_phase('close_'+phase):c.close()
+
 @dataclass
 class LocalConfig:
     spool: str = '/var/lib/loxone-bronze/spool.sqlite3'
@@ -122,7 +146,8 @@ def connect_local(cfg):
     out=Path(cfg.outbox); out.mkdir(parents=True,exist_ok=True)
     if shutil.disk_usage(out).free < cfg.min_free_mb*1024**2:
         raise RuntimeError('Insufficient free space')
-    c=duckdb.connect(cfg.database,config={'threads':1,'memory_limit':f'{cfg.memory_mb}MB'})
+    with database_phase('open'):
+        c=duckdb.connect(cfg.database,config={'threads':1,'memory_limit':f'{cfg.memory_mb}MB'})
     c.execute("SET TimeZone='UTC'")
     c.execute("SET preserve_insertion_order=false")
     c.execute("SET max_temp_directory_size='2GB'")
@@ -335,7 +360,7 @@ def import_spool(c,cfg,table):
         c.execute('DROP TABLE import_rows')
         cursor=rows[-1]['spool_rowid']
         c.execute('INSERT OR REPLACE INTO import_progress VALUES (?,?)',[table,cursor])
-        c.execute('COMMIT')
+        commit_local(c,'import_'+table)
     except BaseException:
         # DuckDB can already have aborted a failed COMMIT. Preserve its cause.
         try:c.execute('ROLLBACK')
@@ -380,7 +405,7 @@ def scan_remapping(c,sc,cfg):
         c.execute('''INSERT INTO process_queue SELECT b.* FROM remap_candidates b
           WHERE NOT EXISTS(SELECT 1 FROM process_queue q WHERE q.source_id=b.source_id AND q.message_id=b.message_id)''')
         c.execute("INSERT OR REPLACE INTO local_metadata VALUES ('remap_cursor',?)",[str(end)])
-        c.execute('COMMIT')
+        commit_local(c,'remapping')
     except BaseException:
         try:c.execute('ROLLBACK')
         except duckdb.TransactionException:pass
@@ -473,7 +498,7 @@ def process_local_batch(c,sc,cfg):
         c.execute("INSERT INTO publication_queue VALUES (?,'pending',?)",[seq,manifest])
         c.execute(f'DROP TABLE {sc.silver}._refresh_batch')
         c.execute(f'DROP TABLE {sc.silver}._refresh_events')
-        c.execute('COMMIT')
+        commit_local(c,'transform')
     except BaseException:
         try:c.execute('ROLLBACK')
         except duckdb.TransactionException:pass
@@ -509,7 +534,7 @@ def run(cfg):
                         # Imports commit before their SQLite acknowledgement.
                         # Release the non-spillable primary-key index buffers
                         # before transforming events under the same RAM cap.
-                        c.close()
+                        close_local(c,'post_import')
                         c,sc=connect_local(cfg)
                 result=process_local_batch(c,sc,cfg)
                 if result: batches.append(result); LOG.info('local_batch %s',json.dumps(result))
@@ -522,7 +547,7 @@ def run(cfg):
               'pruned_spool_rows':sum(pruned.values()),'pruned_working_messages':working_pruned,
               'elapsed_seconds':round(time.monotonic()-start,2)}
             LOG.info('local_summary %s',json.dumps(summary)); return summary
-        finally: c.close()
+        finally: close_local(c,'final')
 
 
 def safe_failure_context(exc):

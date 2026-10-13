@@ -138,9 +138,14 @@ reopening the connection alone does not release all native allocations. Install
 `systemd/loxone-local-silver-pi3.service.conf` as a service drop-in and
 `systemd/loxone-local-silver-pi3.timer.conf` as a timer drop-in, then reload
 systemd. They cap the service at 200 MiB, disable swap, allow half of one CPU
-core, check the memory controller, enforce a 120-second hard timeout and pause
+core, check the memory controller, enforce a 600-second hard timeout and pause
 ten seconds after each process. The 30-second application budget is checked
-between batches and does not interrupt an individual batch. Do not activate
+between batches and does not interrupt an individual batch. A WAL-triggered
+checkpoint can make COMMIT or connection close exceed two minutes under these
+resource caps; repeatedly killing it prevents progress. The hard bound allows
+that occasional checkpoint to finish without increasing CPU or RAM limits.
+Phase start/end logs identify database open, import/transform commit and close,
+including elapsed time without SQL, payloads or exception text. Do not activate
 the timer until individual runs pass; observe repeated runs and collector
 freshness before enabling it across reboots. The profile does not enable pruning
 or publication.
