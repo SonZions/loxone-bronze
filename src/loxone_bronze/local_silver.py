@@ -457,9 +457,9 @@ def materialize_local_state_values(c,sc):
         for position,(key,value) in enumerate(pairs):
             rows.append((source,message,key,encode_json_pairs(value),position))
             if len(rows)>=128:
-                c.executemany('INSERT INTO local_state_values VALUES (?,?,?,?,?)',rows)
+                c.execute('INSERT INTO local_state_values SELECT unnest(?),unnest(?),unnest(?),unnest(?)::JSON,unnest(?)',[list(column) for column in zip(*rows)])
                 rows.clear()
-        if rows:c.executemany('INSERT INTO local_state_values VALUES (?,?,?,?,?)',rows)
+        if rows:c.execute('INSERT INTO local_state_values SELECT unnest(?),unnest(?),unnest(?),unnest(?)::JSON,unnest(?)',[list(column) for column in zip(*rows)])
 
 
 def process_local_batch(c,sc,cfg):
