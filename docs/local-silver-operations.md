@@ -248,3 +248,9 @@ An uncommitted transformation that exceeds the DuckDB memory budget rolls back
 and retries with a fresh connection and half the message count, down to one
 message. The CPU/RAM caps remain unchanged. A single-message failure still stops
 the job with an error; retries never skip or acknowledge failed messages.
+
+Large local state snapshots are decoded one selected message at a time into
+128-row insert chunks before the SQL window and mapping join. This avoids
+json_each lateral expansion retaining the full JSON snapshot per state.
+Duplicate object members keep last-key-wins event semantics, while nested JSON
+objects retain their member order and duplicate members. Cloud SQL is unchanged.

@@ -59,6 +59,33 @@ class LocalSilverTests(unittest.TestCase):
             self.assertEqual(c.execute('SELECT count(*) FROM loxone_silver.processed_messages').fetchone()[0],3)
         self.assertEqual(len(list(Path(self.cfg.outbox).glob('*/manifest.json'))),2)
 
+    def test_large_state_snapshot_under_small_memory_budget(self):
+        self.structure()
+        states={f'state-{i}':'x'*64 for i in range(1850)}
+        states[STATE]=7
+        self.spool.insert_message(message_id='snapshot',source_id='home',run_id='r',
+          received_at='2026-09-01T00:00:00+00:00',message_type=2,payload_format='json',
+          payload_json=json.dumps({'parsed':states}),payload_sha256='h',collector_version='test')
+        self.cfg.memory_mb=96
+        result=run(self.cfg)
+        self.assertEqual(result['pending_messages'],0)
+        with duckdb.connect(self.cfg.database) as c:
+            self.assertEqual(c.execute('SELECT count(*) FROM loxone_silver.state_events').fetchone()[0],1851)
+            self.assertEqual(c.execute('SELECT value_numeric FROM loxone_silver.state_events WHERE state_uuid=?',[STATE]).fetchone()[0],7)
+
+    def test_duplicate_json_keys_and_pointer_escaping_preserved(self):
+        self.structure()
+        self.spool.insert_message(message_id='duplicates',source_id='home',run_id='r',
+          received_at='2026-09-01T00:00:00+00:00',message_type=2,payload_format='json',
+          payload_json='{"parsed":{"a/b~c":1,"a/b~c":2}}',payload_sha256='h',collector_version='test')
+        self.spool.insert_message(message_id='escaped',source_id='home',run_id='r',
+          received_at='2026-09-01T00:00:01+00:00',message_type=2,payload_format='json',
+          payload_json='{"parsed":{"a/b~c":3}}',payload_sha256='h',collector_version='test')
+        run(self.cfg)
+        with duckdb.connect(self.cfg.database) as c:
+            self.assertEqual(c.execute('SELECT message_id,state_uuid,value_numeric FROM loxone_silver.state_events ORDER BY message_id').fetchall(),
+                             [('duplicates','a/b~c',2),('escaped','a/b~c',3)])
+
     def test_memory_retry_stops_at_single_message(self):
         self.structure();self.message()
         with patch.object(local_silver_module,'sha256',side_effect=duckdb.OutOfMemoryException('synthetic')):

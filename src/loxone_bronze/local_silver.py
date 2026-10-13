@@ -434,6 +434,34 @@ def finalize_outbox(c,cfg):
             for path in directory.glob('*.parquet'): path.unlink()
 
 
+class JSONPairs(list):
+    """Retain object member order and duplicate keys during local JSON splitting."""
+
+
+def encode_json_pairs(value):
+    if isinstance(value,JSONPairs):
+        return '{'+','.join(json.dumps(k,ensure_ascii=False)+':'+encode_json_pairs(v) for k,v in value)+'}'
+    if isinstance(value,list):
+        return '['+','.join(encode_json_pairs(v) for v in value)+']'
+    return json.dumps(value,ensure_ascii=False,separators=(',',':'))
+
+
+def materialize_local_state_values(c,sc):
+    # json_each's lateral expansion can retain a full snapshot per state. Split
+    # only the selected messages into narrow rows before DuckDB's window/join.
+    c.execute('CREATE OR REPLACE TEMP TABLE local_state_values(source_id VARCHAR,message_id VARCHAR,key VARCHAR,value JSON,id BIGINT)')
+    messages=c.execute(f'SELECT source_id,message_id,parsed FROM {sc.silver}._refresh_batch').fetchall()
+    for source,message,parsed in messages:
+        pairs=json.loads(parsed,object_pairs_hook=JSONPairs)
+        rows=[]
+        for position,(key,value) in enumerate(pairs):
+            rows.append((source,message,key,encode_json_pairs(value),position))
+            if len(rows)>=128:
+                c.executemany('INSERT INTO local_state_values VALUES (?,?,?,?,?)',rows)
+                rows.clear()
+        if rows:c.executemany('INSERT INTO local_state_values VALUES (?,?,?,?,?)',rows)
+
+
 def process_local_batch(c,sc,cfg):
     c.execute(f'CREATE OR REPLACE TEMP TABLE chosen AS {queue_slice(cfg)}')
     selected=c.execute('SELECT count(*) FROM chosen').fetchone()[0]
@@ -461,7 +489,14 @@ def process_local_batch(c,sc,cfg):
           SELECT p.source_id,p.message_id,p.structure_id FROM {sc.silver}.processed_messages p
           SEMI JOIN chosen q USING(source_id,message_id)''')
         sql=sc.sql('batch.sql',processed_messages='local_processed_messages',ws_messages='local_ws_messages')
-        c.execute(sql)
+        statements=c.extract_statements(sql)
+        c.execute(statements[0])
+        with database_phase('split_state_values'):
+            materialize_local_state_values(c,sc)
+        expansion=f'FROM {sc.silver}._refresh_batch b, json_each(b.parsed) e'
+        narrow=f'FROM {sc.silver}._refresh_batch b JOIN (SELECT source_id,message_id,key,value,json_type(value) AS type,id FROM local_state_values) e USING(source_id,message_id)'
+        for statement in statements[1:]:
+            c.execute(statement.query.replace(expansion,narrow))
         events=c.execute(f'SELECT count(*) FROM {sc.silver}._refresh_events').fetchone()[0]
         c.execute(f'''CREATE OR REPLACE TEMP TABLE next_latest AS
           SELECT * FROM (SELECT * FROM latest_events UNION ALL
