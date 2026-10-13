@@ -37,6 +37,36 @@ class LocalSilverTests(unittest.TestCase):
         data={'controls':{'meter':{'name':name,'type':'Meter','states':{'actual':STATE}}},'padding':'x'*1100}
         self.spool.insert_structure(structure_id=sid,source_id='home',captured_at=at,last_modified=None,
           payload_json=json.dumps(data),payload_sha256='h',collector_version='test')
+    def test_memory_retry_rolls_back_reopens_and_halves_without_duplicates(self):
+        self.structure();self.message();self.message('m2',3);self.message('m3',5)
+        original=local_silver_module.sha256
+        failed=False
+        def fail_once(path):
+            nonlocal failed
+            if not failed:
+                failed=True
+                raise duckdb.OutOfMemoryException('synthetic export memory failure')
+            return original(path)
+        with patch.object(local_silver_module,'sha256',side_effect=fail_once), \
+             patch.object(local_silver_module,'connect_local',wraps=connect_local) as opens:
+            result=run(self.cfg)
+        self.assertTrue(failed)
+        self.assertTrue(any(call.args[0].batch_size==1 for call in opens.call_args_list))
+        self.assertEqual(result['pending_messages'],0)
+        run(self.cfg)
+        with duckdb.connect(self.cfg.database) as c:
+            self.assertEqual(c.execute('SELECT count(*) FROM loxone_silver.state_events').fetchone()[0],3)
+            self.assertEqual(c.execute('SELECT count(*) FROM loxone_silver.processed_messages').fetchone()[0],3)
+        self.assertEqual(len(list(Path(self.cfg.outbox).glob('*/manifest.json'))),2)
+
+    def test_memory_retry_stops_at_single_message(self):
+        self.structure();self.message()
+        with patch.object(local_silver_module,'sha256',side_effect=duckdb.OutOfMemoryException('synthetic')):
+            with self.assertRaises(duckdb.OutOfMemoryException):run(self.cfg)
+        with duckdb.connect(self.cfg.database) as c:
+            self.assertEqual(c.execute('SELECT count(*) FROM loxone_silver.processed_messages').fetchone()[0],0)
+        self.assertEqual(len(list(Path(self.cfg.outbox).glob('*/manifest.json'))),0)
+
     def test_offline_replay_and_materialized_results(self):
         self.structure();self.message();self.message('m2',3,'2026-09-01T00:20:00+00:00')
         run(self.cfg);run(self.cfg)

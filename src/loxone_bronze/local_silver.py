@@ -6,7 +6,7 @@ UID to read/acknowledge the spool without exposing its environment or credential
 from __future__ import annotations
 import argparse
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 import fcntl
 import hashlib
@@ -446,6 +446,7 @@ def process_local_batch(c,sc,cfg):
         shutil.rmtree(directory)
     directory.mkdir(mode=0o700)
     c.execute('BEGIN')
+    committed=False
     try:
         # A view allows JSON predicates to move ahead of the queue join and
         # parse all historical payloads. Materialize the raw slice first; the
@@ -499,9 +500,12 @@ def process_local_batch(c,sc,cfg):
         c.execute(f'DROP TABLE {sc.silver}._refresh_batch')
         c.execute(f'DROP TABLE {sc.silver}._refresh_events')
         commit_local(c,'transform')
-    except BaseException:
+        committed=True
+    except BaseException as exc:
         try:c.execute('ROLLBACK')
         except duckdb.TransactionException:pass
+        if isinstance(exc,duckdb.OutOfMemoryException) and not committed:
+            exc.local_batch_retryable=True
         raise
     finalize_outbox(c,cfg)
     return {'messages':selected,'events':events,'sequence':seq}
@@ -536,7 +540,22 @@ def run(cfg):
                         # before transforming events under the same RAM cap.
                         close_local(c,'post_import')
                         c,sc=connect_local(cfg)
-                result=process_local_batch(c,sc,cfg)
+                transform_cfg=cfg
+                sc=replace(sc,batch_size=cfg.batch_size)
+                while True:
+                    try:
+                        result=process_local_batch(c,sc,transform_cfg)
+                        break
+                    except duckdb.OutOfMemoryException as exc:
+                        if not getattr(exc,'local_batch_retryable',False) or transform_cfg.batch_size<=1:
+                            raise
+                        smaller=max(1,transform_cfg.batch_size//2)
+                        LOG.warning('local_batch_retry reason=memory_limit previous_size=%s next_size=%s',
+                                    transform_cfg.batch_size,smaller)
+                        close_local(c,'memory_retry')
+                        transform_cfg=replace(transform_cfg,batch_size=smaller)
+                        c,sc=connect_local(transform_cfg)
+                        finalize_outbox(c,transform_cfg)
                 if result: batches.append(result); LOG.info('local_batch %s',json.dumps(result))
                 elif not scanned: break
             pruned=prune_local_archived(cfg) if cfg.prune_local_only else {}

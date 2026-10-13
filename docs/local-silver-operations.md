@@ -243,3 +243,8 @@ Stop all three local timers and drain their jobs before changing their release o
 restoring files. Keep the retention gate: it prevents data loss while local work is
 paused. The separate cloud SQL timer must remain disabled during this transition.
 Switching code never deletes cloud tables or the local archive.
+
+An uncommitted transformation that exceeds the DuckDB memory budget rolls back
+and retries with a fresh connection and half the message count, down to one
+message. The CPU/RAM caps remain unchanged. A single-message failure still stops
+the job with an error; retries never skip or acknowledge failed messages.
