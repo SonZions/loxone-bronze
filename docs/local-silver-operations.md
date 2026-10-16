@@ -254,3 +254,9 @@ Large local state snapshots are decoded one selected message at a time into
 json_each lateral expansion retaining the full JSON snapshot per state.
 Duplicate object members keep last-key-wins event semantics, while nested JSON
 objects retain their member order and duplicate members. Cloud SQL is unchanged.
+
+Publication files and their directories are synced before the database commit.
+Ready manifests use a synced temporary file and atomic replacement, followed
+by a directory sync. Missing, empty, malformed or mismatching manifests are
+recovered from committed publication metadata only after all transport-file
+checksums match. Damaged transport data fails closed without acknowledgement.

@@ -357,6 +357,29 @@ class LocalSilverTests(unittest.TestCase):
         self.message('m4')
         with self.spool.connect() as src:
             self.assertEqual(src.execute("SELECT rowid FROM ws_messages WHERE message_id='m4'").fetchone()[0],4)
+    def test_empty_or_truncated_publication_manifest_recovers_from_committed_metadata(self):
+        self.message();run(self.cfg)
+        path=next(Path(self.cfg.outbox).glob('*/manifest.json'))
+        expected=json.loads(path.read_text())
+        for broken in ('','{"version":'):
+            path.write_text(broken)
+            c,sc=connect_local(self.cfg)
+            try:finalize_outbox(c,self.cfg)
+            finally:c.close()
+            self.assertEqual(validate_batch(path.parent),expected)
+
+    def test_manifest_recovery_refuses_damaged_transport_files(self):
+        self.message();run(self.cfg)
+        path=next(Path(self.cfg.outbox).glob('*/manifest.json'))
+        path.write_text('')
+        (path.parent/'state_events.parquet').write_bytes(b'corrupt')
+        c,sc=connect_local(self.cfg)
+        try:
+            with self.assertRaisesRegex(RuntimeError,'checksum mismatch'):finalize_outbox(c,self.cfg)
+        finally:c.close()
+        self.assertEqual(path.read_text(),'')
+        self.assertFalse((path.parent/'ACK').exists())
+
     def test_missing_archive_after_pruning_fails_closed(self):
         self.message();run(self.cfg)
         Path(self.cfg.database).unlink()

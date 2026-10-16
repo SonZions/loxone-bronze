@@ -426,8 +426,19 @@ def finalize_outbox(c,cfg):
         directory=root/f'{seq:020d}'
         if not directory.is_dir(): raise RuntimeError('Committed publication files missing')
         ready=directory/'manifest.json'
-        if not ready.exists():
-            tmp=directory/'manifest.tmp'; tmp.write_text(manifest); os.replace(tmp,ready)
+        expected=json.loads(manifest)
+        try:
+            valid=json.loads(ready.read_text())==expected
+        except (FileNotFoundError,json.JSONDecodeError,UnicodeDecodeError):
+            valid=False
+        if not valid:
+            # The committed database manifest is authoritative. Do not expose
+            # a repaired ready marker unless its transport files still match.
+            for name,digest in expected['files'].items():
+                if sha256(directory/name)!=digest:
+                    raise RuntimeError('Publication recovery checksum mismatch')
+            _write_manifest(ready,expected)
+            LOG.info('local_manifest_recovered sequence=%s',seq)
         if (directory/'ACK').exists():
             c.execute("UPDATE publication_queue SET status='published' WHERE sequence=?",[seq])
             # Keep audit metadata; discard only acknowledged transport copies.
@@ -528,6 +539,8 @@ def process_local_batch(c,sc,cfg):
             c.execute(f'COPY ({query}) TO ? (FORMAT PARQUET, COMPRESSION ZSTD)',[str(path)])
             with path.open('rb') as f: os.fsync(f.fileno())
             files[path.name]=sha256(path)
+        _fsync_directory(directory)
+        _fsync_directory(directory.parent)
         pipeline=c.execute("SELECT value FROM local_metadata WHERE key='pipeline_id'").fetchone()[0]
         manifest=json.dumps({'version':1,'pipeline_id':pipeline,'sequence':seq,'files':files,
           'messages':selected,'events':events,'created_at':datetime.now(timezone.utc).isoformat()})
