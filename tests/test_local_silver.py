@@ -9,6 +9,7 @@ import time
 import unittest
 from unittest.mock import patch
 import duckdb
+import loxone_bronze.local_silver as local_silver_module
 from loxone_bronze.spool import Spool
 from loxone_bronze.local_silver import (LocalConfig,enable_retention_guard,connect_local,
     archive_spool,import_spool,run,finalize_outbox,process_local_batch,enqueue_remapping,
@@ -36,6 +37,63 @@ class LocalSilverTests(unittest.TestCase):
         data={'controls':{'meter':{'name':name,'type':'Meter','states':{'actual':STATE}}},'padding':'x'*1100}
         self.spool.insert_structure(structure_id=sid,source_id='home',captured_at=at,last_modified=None,
           payload_json=json.dumps(data),payload_sha256='h',collector_version='test')
+    def test_memory_retry_rolls_back_reopens_and_halves_without_duplicates(self):
+        self.structure();self.message();self.message('m2',3);self.message('m3',5)
+        original=local_silver_module.sha256
+        failed=False
+        def fail_once(path):
+            nonlocal failed
+            if not failed:
+                failed=True
+                raise duckdb.OutOfMemoryException('synthetic export memory failure')
+            return original(path)
+        with patch.object(local_silver_module,'sha256',side_effect=fail_once), \
+             patch.object(local_silver_module,'connect_local',wraps=connect_local) as opens:
+            result=run(self.cfg)
+        self.assertTrue(failed)
+        self.assertTrue(any(call.args[0].batch_size==1 for call in opens.call_args_list))
+        self.assertEqual(result['pending_messages'],0)
+        run(self.cfg)
+        with duckdb.connect(self.cfg.database) as c:
+            self.assertEqual(c.execute('SELECT count(*) FROM loxone_silver.state_events').fetchone()[0],3)
+            self.assertEqual(c.execute('SELECT count(*) FROM loxone_silver.processed_messages').fetchone()[0],3)
+        self.assertEqual(len(list(Path(self.cfg.outbox).glob('*/manifest.json'))),2)
+
+    def test_large_state_snapshot_under_small_memory_budget(self):
+        self.structure()
+        states={f'state-{i}':'x'*64 for i in range(1850)}
+        states[STATE]=7
+        self.spool.insert_message(message_id='snapshot',source_id='home',run_id='r',
+          received_at='2026-09-01T00:00:00+00:00',message_type=2,payload_format='json',
+          payload_json=json.dumps({'parsed':states}),payload_sha256='h',collector_version='test')
+        self.cfg.memory_mb=96
+        result=run(self.cfg)
+        self.assertEqual(result['pending_messages'],0)
+        with duckdb.connect(self.cfg.database) as c:
+            self.assertEqual(c.execute('SELECT count(*) FROM loxone_silver.state_events').fetchone()[0],1851)
+            self.assertEqual(c.execute('SELECT value_numeric FROM loxone_silver.state_events WHERE state_uuid=?',[STATE]).fetchone()[0],7)
+
+    def test_duplicate_json_keys_and_pointer_escaping_preserved(self):
+        self.structure()
+        self.spool.insert_message(message_id='duplicates',source_id='home',run_id='r',
+          received_at='2026-09-01T00:00:00+00:00',message_type=2,payload_format='json',
+          payload_json='{"parsed":{"a/b~c":1,"a/b~c":2}}',payload_sha256='h',collector_version='test')
+        self.spool.insert_message(message_id='escaped',source_id='home',run_id='r',
+          received_at='2026-09-01T00:00:01+00:00',message_type=2,payload_format='json',
+          payload_json='{"parsed":{"a/b~c":3}}',payload_sha256='h',collector_version='test')
+        run(self.cfg)
+        with duckdb.connect(self.cfg.database) as c:
+            self.assertEqual(c.execute('SELECT message_id,state_uuid,value_numeric FROM loxone_silver.state_events ORDER BY message_id').fetchall(),
+                             [('duplicates','a/b~c',2),('escaped','a/b~c',3)])
+
+    def test_memory_retry_stops_at_single_message(self):
+        self.structure();self.message()
+        with patch.object(local_silver_module,'sha256',side_effect=duckdb.OutOfMemoryException('synthetic')):
+            with self.assertRaises(duckdb.OutOfMemoryException):run(self.cfg)
+        with duckdb.connect(self.cfg.database) as c:
+            self.assertEqual(c.execute('SELECT count(*) FROM loxone_silver.processed_messages').fetchone()[0],0)
+        self.assertEqual(len(list(Path(self.cfg.outbox).glob('*/manifest.json'))),0)
+
     def test_offline_replay_and_materialized_results(self):
         self.structure();self.message();self.message('m2',3,'2026-09-01T00:20:00+00:00')
         run(self.cfg);run(self.cfg)
@@ -62,6 +120,186 @@ class LocalSilverTests(unittest.TestCase):
         self.message('m4')
         with self.spool.connect() as src:
             self.assertEqual(src.execute("SELECT rowid FROM ws_messages WHERE message_id='m4'").fetchone()[0],4)
+
+    def test_hourly_refresh_includes_prior_batch_with_out_of_order_events(self):
+        self.structure()
+        self.cfg.batch_size=1;self.cfg.max_batches=1
+        self.message('m1',3,'2026-09-01T00:20:00+00:00')
+        self.message('m2',1,'2026-09-01T00:10:00+00:00')
+        self.message('m3',9,'2026-09-01T01:00:00+00:00')
+        run(self.cfg);run(self.cfg)
+        directories=sorted(Path(self.cfg.outbox).glob('*/manifest.json'))
+        c=duckdb.connect()
+        try:
+            row=c.execute('SELECT event_count,numeric_min,numeric_max,numeric_avg,numeric_first,numeric_last FROM read_parquet(?)',
+                [str(directories[-1].parent/'hourly_state.parquet')]).fetchone()
+            self.assertEqual(row,(2,1,3,2,1,3))
+        finally:c.close()
+
+    def test_transport_events_match_persisted_rows_including_load_timestamp(self):
+        self.structure();self.message('m1',1);self.message('m2',3,'2026-09-01T00:20:00+00:00')
+        run(self.cfg)
+        directory=next(Path(self.cfg.outbox).glob('*/manifest.json')).parent
+        with duckdb.connect(self.cfg.database) as c:
+            stored=c.execute('SELECT * FROM loxone_silver.state_events ORDER BY message_id').fetchall()
+            exported=c.execute('SELECT * FROM read_parquet(?) ORDER BY message_id',[str(directory/'state_events.parquet')]).fetchall()
+            self.assertEqual(exported,stored)
+            self.assertIsNotNone(stored[0][-1])
+
+    def test_queue_processes_oldest_receipt_and_acknowledges_same_slice(self):
+        self.structure();self.cfg.batch_size=1;self.cfg.max_batches=1
+        self.message('a-new',3,'2026-09-02T00:00:00+00:00')
+        self.message('z-old',1,'2026-09-01T00:00:00+00:00')
+        run(self.cfg)
+        with duckdb.connect(self.cfg.database) as c:
+            self.assertEqual(c.execute('SELECT message_id FROM process_queue').fetchall(),[('a-new',)])
+            self.assertEqual(c.execute('SELECT message_id FROM loxone_silver.processed_messages').fetchall(),[('z-old',)])
+        run(self.cfg)
+        with duckdb.connect(self.cfg.database) as c:
+            self.assertEqual(c.execute('SELECT count(*) FROM process_queue').fetchone()[0],0)
+            self.assertEqual(c.execute('SELECT value_numeric FROM latest_events').fetchone()[0],3)
+
+    def test_reopen_failure_after_import_resumes_without_losing_or_duplicating_rows(self):
+        self.structure();self.message('m1');self.message('m2',2)
+        connections=0
+        def reopen(cfg):
+            nonlocal connections
+            connections+=1
+            if connections==2:raise RuntimeError('Simulated reopen failure')
+            return connect_local(cfg)
+        with patch('loxone_bronze.local_silver.connect_local',side_effect=reopen):
+            with self.assertRaisesRegex(RuntimeError,'Simulated reopen failure'):run(self.cfg)
+        with duckdb.connect(self.cfg.database) as c:
+            self.assertEqual(c.execute('SELECT count(*) FROM process_queue').fetchone()[0],2)
+            self.assertEqual(c.execute('SELECT count(*) FROM loxone_silver.state_events').fetchone()[0],0)
+        with self.spool.connect() as c:
+            self.assertEqual(c.execute("SELECT rowid_highwater FROM local_silver_checkpoints WHERE table_name='ws_messages'").fetchone()[0],2)
+        run(self.cfg);run(self.cfg)
+        with duckdb.connect(self.cfg.database) as c:
+            self.assertEqual(c.execute('SELECT count(*) FROM loxone_bronze.archive_messages').fetchone()[0],2)
+            self.assertEqual(c.execute('SELECT count(*) FROM loxone_silver.state_events').fetchone()[0],2)
+            self.assertEqual(c.execute('SELECT count(*) FROM process_queue').fetchone()[0],0)
+
+    def test_bounded_ledger_replays_late_structure_and_ignores_other_source(self):
+        self.structure();self.message('m1',7,'2026-09-03T00:00:00+00:00')
+        run(self.cfg)
+        with duckdb.connect(self.cfg.database) as c:
+            c.execute("INSERT INTO loxone_silver.processed_messages(source_id,message_id,structure_id) VALUES ('other','m2','s1')")
+        self.structure('s2','2026-09-02','Updated meter')
+        self.message('m2',9,'2026-09-03T00:10:00+00:00')
+        run(self.cfg);run(self.cfg)
+        with duckdb.connect(self.cfg.database) as c:
+            self.assertEqual(c.execute('SELECT message_id,control_name,value_numeric FROM loxone_silver.state_events ORDER BY message_id').fetchall(),
+                [('m1','Updated meter',7),('m2','Updated meter',9)])
+            self.assertEqual(c.execute("SELECT message_id,structure_id FROM loxone_silver.processed_messages WHERE source_id='home' ORDER BY message_id").fetchall(),
+                [('m1','s2'),('m2','s2')])
+            self.assertEqual(c.execute('SELECT count(*) FROM process_queue').fetchone()[0],0)
+
+    def test_work_index_migration_preserves_pending_rows_and_replay(self):
+        self.structure();self.message('m1',7);run(self.cfg)
+        self.message('m2',9)
+        c,sc=connect_local(self.cfg)
+        try:
+            import_spool(c,self.cfg,'ws_messages')
+            c.execute('DROP VIEW loxone_bronze.ws_messages')
+            c.execute('ALTER TABLE process_queue DROP COLUMN received_at')
+            c.execute('ALTER TABLE process_queue ADD PRIMARY KEY(source_id,message_id)')
+            c.execute('ALTER TABLE loxone_silver.processed_messages ADD PRIMARY KEY(source_id,message_id)')
+            ledger=c.execute('SELECT * FROM loxone_silver.processed_messages').fetchall()
+            cursors=c.execute('SELECT * FROM import_progress ORDER BY table_name').fetchall()
+        finally:c.close()
+        with self.assertRaisesRegex(RuntimeError,'migrate-local-work-indexes'):connect_local(self.cfg)
+        script=runpy.run_path(str(Path(__file__).resolve().parents[1]/'scripts/migrate-local-work-indexes.py'))
+        script['migrate'](self.cfg.database,1,1)
+        with duckdb.connect(self.cfg.database) as c:
+            self.assertEqual(c.execute('SELECT * FROM loxone_silver.processed_messages').fetchall(),ledger)
+            self.assertEqual(c.execute('SELECT * FROM import_progress ORDER BY table_name').fetchall(),cursors)
+            self.assertEqual(c.execute('SELECT count(*) FROM process_queue_before_work_migration').fetchone()[0],1)
+            self.assertEqual(c.execute("SELECT count(*) FROM duckdb_constraints() WHERE table_name IN ('process_queue','processed_messages') AND constraint_type='PRIMARY KEY'").fetchone()[0],0)
+        run(self.cfg);run(self.cfg)
+        with duckdb.connect(self.cfg.database) as c:
+            self.assertEqual(c.execute('SELECT count(*) FROM loxone_silver.state_events').fetchone()[0],2)
+            self.assertEqual(c.execute('SELECT count(*) FROM loxone_silver.processed_messages WHERE processed_at IS NOT NULL').fetchone()[0],2)
+
+    def test_remapping_scans_bounded_chunks_and_deduplicates_existing_queue(self):
+        self.structure()
+        for i in range(8):self.message(f'm{i}',i,'2026-09-03T00:00:00+00:00')
+        for _ in range(4):run(self.cfg)
+        self.structure('s2','2026-09-02','Updated meter')
+        c,sc=connect_local(self.cfg)
+        try:
+            import_spool(c,self.cfg,'structures');sync_local_structure(c,sc,enqueue_remapping)
+            self.assertEqual(c.execute('SELECT count(*) FROM process_queue').fetchone()[0],0)
+            self.assertEqual(local_silver_module.scan_remapping(c,sc,self.cfg),3)
+            self.assertEqual(c.execute('SELECT count(*) FROM process_queue').fetchone()[0],3)
+            enqueue_remapping(c,sc)  # restarting the scan must not duplicate work
+            self.assertEqual(local_silver_module.scan_remapping(c,sc,self.cfg),3)
+            self.assertEqual(c.execute('SELECT count(*) FROM process_queue').fetchone()[0],3)
+        finally:c.close()
+        for _ in range(4):run(self.cfg)
+        with duckdb.connect(self.cfg.database) as c:
+            self.assertEqual(c.execute("SELECT count(*) FROM loxone_silver.processed_messages WHERE structure_id='s2'").fetchone()[0],8)
+            self.assertEqual(c.execute('SELECT count(*) FROM loxone_silver.state_events').fetchone()[0],8)
+            self.assertEqual(c.execute('SELECT count(*) FROM process_queue').fetchone()[0],0)
+
+    def test_index_retirement_preserves_rows_cursors_and_replay(self):
+        self.structure();self.message('m1',7)
+        c,sc=connect_local(self.cfg)
+        try:
+            c.execute('ALTER TABLE loxone_bronze.archive_messages ADD PRIMARY KEY(source_id,message_id)')
+            import_spool(c,self.cfg,'structures');import_spool(c,self.cfg,'ws_messages')
+            before=c.execute('SELECT * FROM loxone_bronze.archive_messages ORDER BY ALL').fetchall()
+            cursors=c.execute('SELECT * FROM import_progress ORDER BY table_name').fetchall()
+        finally:c.close()
+        script=runpy.run_path(str(Path(__file__).resolve().parents[1]/'scripts/retire-local-archive-index.py'))
+        script['retire'](Path(self.cfg.database),1)
+        c,sc=connect_local(self.cfg)
+        try:
+            self.assertEqual(c.execute("SELECT count(*) FROM duckdb_constraints() WHERE schema_name='loxone_bronze' AND table_name='archive_messages' AND constraint_type='PRIMARY KEY'").fetchone()[0],0)
+            self.assertEqual(c.execute('SELECT * FROM loxone_bronze.archive_messages ORDER BY ALL').fetchall(),before)
+            self.assertEqual(c.execute('SELECT * FROM loxone_bronze.archive_messages_before_index_retirement ORDER BY ALL').fetchall(),before)
+            self.assertEqual(c.execute('SELECT * FROM import_progress ORDER BY table_name').fetchall(),cursors)
+            c.execute("UPDATE import_progress SET rowid_highwater=0 WHERE table_name='ws_messages'")
+            with self.spool.connect() as src:src.execute("UPDATE local_silver_checkpoints SET rowid_highwater=0 WHERE table_name='ws_messages'")
+            import_spool(c,self.cfg,'ws_messages')
+            self.assertEqual(c.execute('SELECT count(*) FROM loxone_bronze.archive_messages').fetchone()[0],1)
+        finally:c.close()
+        run(self.cfg)
+        with duckdb.connect(self.cfg.database) as c:
+            self.assertEqual(c.execute('SELECT value_numeric FROM loxone_silver.state_events').fetchall(),[(7,)])
+
+    def test_failed_commit_preserves_cause_and_does_not_acknowledge_spool(self):
+        self.message()
+        c,sc=connect_local(self.cfg)
+        class FailedCommit:
+            def execute(self,sql,*args):
+                if sql=='COMMIT':
+                    c.execute('ROLLBACK')
+                    raise duckdb.TransactionException('Original commit failure')
+                return c.execute(sql,*args)
+        try:
+            with self.assertRaisesRegex(duckdb.TransactionException,'Original commit failure'):
+                import_spool(FailedCommit(),self.cfg,'ws_messages')
+            self.assertEqual(c.execute('SELECT count(*) FROM loxone_bronze.archive_messages').fetchone()[0],0)
+            self.assertEqual(c.execute('SELECT count(*) FROM import_progress').fetchone()[0],0)
+            with self.spool.connect() as src:
+                self.assertEqual(src.execute("SELECT rowid_highwater FROM local_silver_checkpoints WHERE table_name='ws_messages'").fetchone()[0],0)
+        finally:c.close()
+    def test_main_logs_commit_memory_cause_without_exception_values(self):
+        secret='private-payload-and-token-value'
+        failure=duckdb.TransactionException('Failed to commit: Out of Memory Error: '+secret)
+        with patch('sys.argv',['local_silver']), \
+             patch.object(LocalConfig,'from_env',return_value=self.cfg), \
+             patch.object(local_silver_module,'run',side_effect=failure), \
+             self.assertLogs(local_silver_module.LOG,level='ERROR') as output:
+            with self.assertRaises(SystemExit) as stopped:
+                local_silver_module.main()
+        self.assertEqual(stopped.exception.code,1)
+        self.assertIn('reason=memory_limit operation=commit',output.output[0])
+        self.assertIn('origin=',output.output[0])
+        self.assertNotIn(secret,output.output[0])
+        self.assertEqual(local_silver_module.safe_failure_context(
+            duckdb.ConstraintException(secret))[:2],('other','unknown'))
     def test_import_skips_message_already_restored_from_cloud_history(self):
         self.message('old',value=7)
         self.message('new',value=8)
@@ -103,7 +341,7 @@ class LocalSilverTests(unittest.TestCase):
         with duckdb.connect(self.cfg.database) as c:
             self.assertEqual(c.execute('SELECT message_id FROM loxone_bronze.archive_messages').fetchall(),[('old',)])
             self.assertEqual(c.execute('SELECT message_id FROM loxone_bronze.archive_messages_before_pk_repair').fetchall(),[('old',)])
-            c.execute("INSERT INTO process_queue VALUES ('home','old')")
+            c.execute("INSERT INTO process_queue VALUES ('home','old',NULL)")
             self.assertEqual(c.execute('SELECT message_id FROM loxone_bronze.ws_messages').fetchall(),[('old',)])
             c.execute("INSERT INTO loxone_bronze.archive_messages(message_id,source_id,payload_json) VALUES ('blocked','home','{}')")
     def test_local_only_prune_requires_archive_ack_and_preserves_cloud_status(self):
@@ -119,6 +357,29 @@ class LocalSilverTests(unittest.TestCase):
         self.message('m4')
         with self.spool.connect() as src:
             self.assertEqual(src.execute("SELECT rowid FROM ws_messages WHERE message_id='m4'").fetchone()[0],4)
+    def test_empty_or_truncated_publication_manifest_recovers_from_committed_metadata(self):
+        self.message();run(self.cfg)
+        path=next(Path(self.cfg.outbox).glob('*/manifest.json'))
+        expected=json.loads(path.read_text())
+        for broken in ('','{"version":'):
+            path.write_text(broken)
+            c,sc=connect_local(self.cfg)
+            try:finalize_outbox(c,self.cfg)
+            finally:c.close()
+            self.assertEqual(validate_batch(path.parent),expected)
+
+    def test_manifest_recovery_refuses_damaged_transport_files(self):
+        self.message();run(self.cfg)
+        path=next(Path(self.cfg.outbox).glob('*/manifest.json'))
+        path.write_text('')
+        (path.parent/'state_events.parquet').write_bytes(b'corrupt')
+        c,sc=connect_local(self.cfg)
+        try:
+            with self.assertRaisesRegex(RuntimeError,'checksum mismatch'):finalize_outbox(c,self.cfg)
+        finally:c.close()
+        self.assertEqual(path.read_text(),'')
+        self.assertFalse((path.parent/'ACK').exists())
+
     def test_missing_archive_after_pruning_fails_closed(self):
         self.message();run(self.cfg)
         Path(self.cfg.database).unlink()
@@ -226,6 +487,19 @@ class LocalSilverTests(unittest.TestCase):
             row=c.execute('''SELECT run_id,payload_format,payload_sha256,collector_version
               FROM loxone_bronze.parquet_ws_messages''').fetchone()
             self.assertEqual(row,('r','json','h','test'))
+        finally:c.close()
+
+    def test_reconnect_reuses_archive_views_and_sees_new_partitions(self):
+        self.structure();self.message()
+        archive_run(ArchiveConfig(self.cfg.spool,self.cfg.bronze_archive,min_free_mb=0))
+        c,_=connect_local(self.cfg);c.close()
+        self.message('m2',at='2026-09-02T00:00:00+00:00')
+        archive_run(ArchiveConfig(self.cfg.spool,self.cfg.bronze_archive,min_free_mb=0))
+        with patch.object(Path,'glob',side_effect=AssertionError('Worker startup enumerated the archive')):
+            c,_=connect_local(self.cfg)
+        try:
+            self.assertEqual(c.execute('SELECT count(*) FROM loxone_bronze.parquet_ws_messages').fetchone()[0],2)
+            self.assertEqual(c.execute('SELECT count(*) FROM loxone_bronze.parquet_structures').fetchone()[0],1)
         finally:c.close()
 
     def test_working_bronze_is_pruned_only_after_processing_and_parquet(self):

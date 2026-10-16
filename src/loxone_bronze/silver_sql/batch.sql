@@ -12,7 +12,7 @@ WITH versions AS (
            CASE WHEN s.structure_id IS NULL THEN 'no_valid_structure'
                 WHEN b.received_at < s.structure_captured_at THEN 'fallback_earliest'
                 ELSE 'asof' END AS structure_resolution
-    FROM ${bronze}.ws_messages b
+    FROM ${ws_messages} b
     LEFT JOIN versions s ON s.source_id=b.source_id
       AND (s.rn=1 OR b.received_at >= s.structure_captured_at)
       AND (s.valid_to IS NULL OR b.received_at < s.valid_to)
@@ -22,7 +22,7 @@ WITH versions AS (
 )
 SELECT d.* FROM desired d
 WHERE NOT EXISTS (
-    SELECT 1 FROM ${silver}.processed_messages p
+    SELECT 1 FROM ${processed_messages} p
     WHERE p.source_id=d.source_id AND p.message_id=d.message_id
       AND p.structure_id IS NOT DISTINCT FROM d.structure_id
 )
@@ -35,6 +35,7 @@ WITH meanings AS (
            control_name, control_type, room_uuid, room_name, category_uuid, category_name,
            mapping_source, mapping_priority
     FROM ${silver}.state_uuid_map
+    WHERE structure_id IN (SELECT structure_id FROM ${silver}._refresh_batch)
 ), best AS (
     SELECT * FROM meanings
     QUALIFY mapping_priority = min(mapping_priority) OVER (PARTITION BY structure_id,state_uuid)
@@ -64,7 +65,7 @@ SELECT e.received_at, timezone('Europe/Berlin',e.received_at) AS received_at_ber
             WHEN m.mapping_source='details' THEN 'resolved_details'
             WHEN m.mapping_source='uuidAction' THEN 'resolved_uuid_action'
             ELSE 'resolved_control' END AS resolution_status,
-       e.ingested_at AS bronze_ingested_at
+       e.ingested_at AS bronze_ingested_at,now() AS loaded_at
 FROM exploded e LEFT JOIN selected m
   ON m.structure_id=e.structure_id AND m.state_uuid=e.state_uuid
 WHERE e.duplicate_rank=1;
