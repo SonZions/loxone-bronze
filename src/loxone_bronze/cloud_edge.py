@@ -34,6 +34,7 @@ class EdgeConfig:
     chunk_bytes: int = 4*1024*1024
     max_chunks: int = 5
     max_seconds: int = 180
+    history_directory: str = ''
     min_messages: int = 1000
     max_wait_seconds: int = 300
 
@@ -127,6 +128,46 @@ def initialize_edge(c,cfg,pipeline):
     initialize(c,cfg.transform)
     seed_latest(c,cfg)
     c.execute(f'CREATE TABLE IF NOT EXISTS {cfg.silver}.published_batches(batch_id VARCHAR PRIMARY KEY,created_at TIMESTAMPTZ,published_at TIMESTAMPTZ,messages BIGINT,events BIGINT)')
+
+
+
+def bootstrap_history(c,cfg):
+    if not cfg.history_directory:return
+    root=Path(cfg.history_directory);manifest=root/'manifest.json'
+    data=manifest.read_bytes();digest=hashlib.sha256(data).hexdigest();meta=json.loads(data)
+    expected={'structures.parquet','structure_versions.parquet','state_uuid_map.parquet'}
+    if meta.get('version')!=1 or set(meta.get('files',{}))!=expected:raise ValueError('Invalid history manifest')
+    marker=c.execute(f"SELECT value FROM {cfg.raw}.control WHERE key='history_bootstrap'").fetchone()
+    if marker==(digest,):return
+    if marker:raise RuntimeError('History bootstrap changed; explicit reconciliation required')
+    for name,info in meta['files'].items():
+        h=hashlib.sha256()
+        with (root/name).open('rb') as f:
+            for block in iter(lambda:f.read(1024*1024),b''):h.update(block)
+        if h.hexdigest()!=info['sha256']:raise RuntimeError('History file checksum mismatch')
+        table=name.removesuffix('.parquet')
+        c.execute(f'CREATE OR REPLACE TABLE {cfg.raw}.history_{table} AS SELECT * FROM read_parquet(?)',[str(root/name)])
+        if c.execute(f'SELECT count(*) FROM {cfg.raw}.history_{table}').fetchone()[0]!=info['rows']:raise RuntimeError('History row count mismatch')
+    c.execute('BEGIN')
+    try:
+        c.execute(f'INSERT OR IGNORE INTO {cfg.raw}.structures BY NAME SELECT * FROM {cfg.raw}.history_structures')
+        c.execute(f'INSERT OR IGNORE INTO {cfg.silver}.structure_versions BY NAME SELECT * FROM {cfg.raw}.history_structure_versions')
+        c.execute(f'''INSERT INTO {cfg.silver}.state_uuid_map BY NAME SELECT b.* FROM {cfg.raw}.history_state_uuid_map b
+            WHERE NOT EXISTS(SELECT 1 FROM {cfg.silver}.state_uuid_map m WHERE m.structure_id=b.structure_id)''')
+        bad=c.execute(f'''SELECT 1 FROM {cfg.raw}.history_structure_versions v WHERE v.state_mapping_count !=
+            (SELECT count(*) FROM {cfg.silver}.state_uuid_map m WHERE m.structure_id=v.structure_id) LIMIT 1''').fetchone()
+        if bad:raise RuntimeError('Historical mapping count mismatch')
+        unknown=c.execute(f'''SELECT 1 FROM {cfg.silver}.state_events e WHERE e.structure_id IS NOT NULL
+            AND NOT EXISTS(SELECT 1 FROM {cfg.silver}.structure_versions v WHERE v.structure_id=e.structure_id) LIMIT 1''').fetchone()
+        if unknown:raise RuntimeError('Historical event references missing structure version')
+        c.execute(f"INSERT INTO {cfg.raw}.control VALUES('history_bootstrap',?)",[digest])
+        for table in ['structures','structure_versions','state_uuid_map']:c.execute(f'DROP TABLE {cfg.raw}.history_{table}')
+        c.execute('COMMIT')
+    except BaseException:
+        try:c.execute('ROLLBACK')
+        except duckdb.TransactionException:pass
+        raise
+    LOG.info('edge_history_bootstrapped %s',json.dumps({name:info['rows'] for name,info in meta['files'].items()}))
 
 
 def current_projection():
@@ -247,6 +288,7 @@ def run(cfg,connect=None,initial_cursor=None):
             try:
                 LOG.info('edge_connected elapsed_seconds=%.3f',time.monotonic()-started)
                 c.execute("SET TimeZone='UTC'");initialize_edge(c,cfg,pipeline)
+                bootstrap_history(c,cfg)
                 with tempfile.TemporaryDirectory(prefix='cloud-edge-',dir=Path(cfg.state).parent) as tmp:
                     for rowid in read_structures(cfg):
                         if time.monotonic()-started>=cfg.max_seconds:break

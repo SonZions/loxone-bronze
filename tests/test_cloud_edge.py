@@ -131,3 +131,25 @@ class EdgeTests(unittest.TestCase):
   with open_state(self.cfg.state,initial_cursor=0) as c:c.execute("INSERT INTO metadata VALUES('retry_after',?)",[str(time.time()+300)])
   with patch.object(self,'connect',side_effect=AssertionError('Backoff must not connect')):
    self.assertEqual(run(self.cfg,connect=self.connect)['reason'],'error_backoff')
+ def test_bootstrap_preserves_local_historical_versions_and_checks_files(self):
+  import hashlib
+  from loxone_bronze.local_silver import LocalConfig,run as local_run
+  self.structure();self.message();self.archive()
+  local=LocalConfig(spool=str(self.spool.path),database=str(self.root/'local.duckdb'),outbox=str(self.root/'outbox'),bronze_archive=str(self.root/'bronze'),batch_size=2,import_size=2,max_batches=4,min_free_mb=0)
+  local_run(local);history=self.root/'history';history.mkdir();manifest={'version':1,'files':{}}
+  with duckdb.connect(local.database) as c:
+   for table in ['structures','structure_versions','state_uuid_map']:
+    src='loxone_bronze.'+table if table=='structures' else 'loxone_silver.'+table;p=history/(table+'.parquet')
+    c.execute('COPY (SELECT * FROM '+src+') TO ? (FORMAT PARQUET)',[str(p)])
+    manifest['files'][p.name]={'sha256':hashlib.sha256(p.read_bytes()).hexdigest(),'rows':c.execute('SELECT count(*) FROM '+src).fetchone()[0]}
+  (history/'manifest.json').write_text(json.dumps(manifest))
+  cfg=replace(self.cfg,history_directory=str(history));run(cfg,connect=self.connect,initial_cursor=0)
+  self.assertEqual(self.query('SELECT count(*) FROM target.silver.structure_versions'),[(1,)])
+  self.assertEqual(self.query('SELECT count(*) FROM target.silver.state_events'),[(1,)])
+  self.assertEqual(self.query("SELECT count(*) FROM target.raw.control WHERE key='history_bootstrap'"),[(1,)])
+  # A new bootstrap with changed transport data fails closed before it is trusted.
+  with (history/'structures.parquet').open('ab') as f:f.write(b'damaged')
+  from loxone_bronze.cloud_edge import bootstrap_history
+  with self.connect() as c:
+   c.execute("DELETE FROM target.raw.control WHERE key='history_bootstrap'")
+   with self.assertRaises(RuntimeError):bootstrap_history(c,cfg)

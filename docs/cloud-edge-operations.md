@@ -33,7 +33,12 @@ The raw staging owner and local destination metadata reject accidental reuse of
 another pipeline's state/schema. Preserve the local state database with its
 pipeline ID. Do not silently recreate it or point it at another destination.
 Cloud staging holds one chunk, durable structure snapshots and acknowledgement
-metadata. It does not hold another complete raw archive.
+metadata. Before cutover, export all historical raw structures, structure versions
+and state mappings from the old local database into the checksummed
+`EDGE_HISTORY_DIRECTORY`. The first cloud run imports this manifest atomically,
+checks mapping counts and refuses historical event references without a matching
+version. Current SQLite snapshots alone may omit older versions that existing
+Silver events still reference. This bootstrap preserves the original version IDs. It does not hold another complete raw archive.
 
 A compact latest-event table is seeded once from retained events with a grouped
 arg-max. Subsequent batches merge only that table and new events, so historical
