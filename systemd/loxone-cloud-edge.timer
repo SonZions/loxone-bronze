@@ -1,0 +1,11 @@
+[Unit]
+Description=Drain archived Loxone messages into MotherDuck Silver
+
+[Timer]
+OnBootSec=5min
+OnUnitInactiveSec=15s
+AccuracySec=5s
+Unit=loxone-cloud-edge.service
+
+[Install]
+WantedBy=timers.target

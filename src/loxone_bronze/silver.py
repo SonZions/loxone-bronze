@@ -55,9 +55,14 @@ class SilverConfig:
         return cls(**{name: type(default)(os.environ.get("SILVER_" + name.upper(), default))
                       for name, default in cls().__dict__.items()})
 
-    def sql(self, name):
+    def sql(self, name, *, processed_messages=None, ws_messages=None):
+        ledger=(identifier(processed_messages) if processed_messages is not None
+                else f'{self.silver}.processed_messages')
+        messages=('.'.join(identifier(part) for part in ws_messages.split('.')) if ws_messages is not None
+                  else f'{self.bronze}.ws_messages')
         return ((SQL_DIR / name).read_text().replace("${bronze}", self.bronze)
-                .replace("${silver}", self.silver).replace("${batch_size}", str(self.batch_size)))
+                .replace("${silver}", self.silver).replace("${batch_size}", str(self.batch_size))
+                .replace("${processed_messages}",ledger).replace("${ws_messages}",messages))
 
 
 def preflight(con, cfg):
@@ -68,12 +73,13 @@ def preflight(con, cfg):
         raise ValueError("Target database is not attached")
 
 
-def initialize(con, cfg):
+def initialize(con, cfg, *, processed_primary_key=True):
     con.execute(cfg.sql("schema.sql"))
     s = cfg.silver
+    key = ', PRIMARY KEY(source_id,message_id)' if processed_primary_key else ''
     con.execute(f"CREATE TABLE IF NOT EXISTS {s}.processed_messages ("
                 "source_id VARCHAR, message_id VARCHAR, structure_id VARCHAR, "
-                "processed_at TIMESTAMPTZ DEFAULT now(), PRIMARY KEY(source_id,message_id))")
+                f"processed_at TIMESTAMPTZ DEFAULT now(){key})")
     con.execute(f"CREATE TABLE IF NOT EXISTS {s}.refresh_guard (id INTEGER PRIMARY KEY, revision BIGINT)")
     con.execute(f"INSERT OR IGNORE INTO {s}.refresh_guard VALUES (1,0)")
 
@@ -111,13 +117,15 @@ def sync_structures(con, cfg, run_id=None):
         raise
 
 
-def process_batch(con, cfg, run_id=None):
+def process_batch(con, cfg, run_id=None, *, after_transform=None, ws_messages=None):
     s = cfg.silver
     try:
         begin(con, cfg)
-        con.execute(cfg.sql("batch.sql"))
+        con.execute(cfg.sql("batch.sql") if ws_messages is None else cfg.sql("batch.sql", ws_messages=ws_messages))
         messages, latest = con.execute(f"SELECT count(*), max(ingested_at) FROM {s}._refresh_batch").fetchone()
         events = con.execute(f"SELECT count(*) FROM {s}._refresh_events").fetchone()[0]
+        if after_transform is not None:
+            after_transform(con, cfg)
         if run_id:
             con.execute(f"UPDATE {s}.load_runs SET messages_processed=messages_processed+?, "
                         "events_inserted=events_inserted+?, "

@@ -85,6 +85,95 @@ copies are removed; local archived Bronze and Silver remain.
 
 ## Deployment and activation
 
+Before starting Silver on a small Pi, check that `memory` appears in
+`/sys/fs/cgroup/cgroup.controllers`. A configured systemd `MemoryMax` does not
+protect the host when the kernel memory controller is disabled. On current
+Raspberry Pi kernels, append `cgroup_enable=memory` to the single line in
+`/boot/firmware/cmdline.txt`, after backing up that file, and perform a controlled
+reboot. Verify the controller and a running service's numeric `MemoryCurrent`
+afterwards. A reboot interrupts the collector and other Pi services.
+
+Normal Silver startup reuses existing Parquet archive views instead of opening
+every archived file's footer. Their stored globs still discover newly archived
+files when queried. Explicit archival/view refreshes can still be expensive.
+Event mapping considers only the structure versions needed by the current batch;
+hourly aggregation restricts scans to the complete hours touched by that batch.
+The local queue selects oldest receipts first and acknowledges exactly that same
+slice. Its ledger lookup is materialized for the selected keys, avoiding a large
+correlated hash table over all processed history. Committed spool imports close
+and reopen their DuckDB connection before event transformation to release index
+buffers; a failed reopen leaves the committed rows queued for the next run.
+The chosen raw slice is also materialized, with receipt bounds, before JSON
+predicates run. This prevents predicates pushed through a view from parsing all
+historical raw payloads. Newly transformed rows carry their explicit transaction
+load timestamp and feed the latest-state update and event transport directly;
+those steps do not reread the entire persistent event history. Hourly refreshes
+still include previously processed events from the touched hours.
+
+New local raw working archives have no primary-key ART index. The worker holds
+both pipeline locks and excludes already archived keys inside the import
+transaction; the SQLite spool supplies unique message IDs. This avoids keeping a
+large, non-spillable raw-key index in RAM. Existing indexed archives require an
+explicit one-time migration with `scripts/retire-local-archive-index.py`, stopped
+Silver timers, and effective CPU/RAM/I/O limits. Pass the verified row count with
+`--expected-rows` and the existing file with `--database`. The script streams a
+constraint-free copy, checks counts, column names/types and unchanged import
+cursors, then atomically swaps names and restores the working view. It retains
+the entire original table as `archive_messages_before_index_retirement` and
+refuses to overwrite an earlier migration. It does not delete spool or event
+data. Keep the existing independent backup as well. A failed COMMIT may already
+have ended the transaction; error handling preserves its original cause rather
+than masking it with a second rollback error.
+
+These changes do not guarantee that a large historical backlog can be processed
+fast enough on a 1 GB Pi. Validate individual runs under effective CPU/memory
+limits before enabling timers, and compare throughput with incoming traffic.
+
+For a Pi 3 with effective memory cgroups, the optional
+`config/local-silver-pi3.env.example` profile uses 250 imported/selected messages,
+96 MB DuckDB memory and exactly one batch per process. Merge its values into the
+existing configuration, preserving paths and checkpoints. Multiple batches in
+one process can succeed initially and then exhaust the internal memory budget;
+reopening the connection alone does not release all native allocations. Install
+`systemd/loxone-local-silver-pi3.service.conf` as a service drop-in and
+`systemd/loxone-local-silver-pi3.timer.conf` as a timer drop-in, then reload
+systemd. They cap the service at 200 MiB, disable swap, allow 60% of one CPU
+core, check the memory controller, enforce a 600-second hard timeout and pause
+ten seconds after each process. The 30-second application budget is checked
+between batches and does not interrupt an individual batch. A WAL-triggered
+checkpoint can make COMMIT or connection close exceed two minutes under these
+resource caps; repeatedly killing it prevents progress. The hard bound allows
+that occasional checkpoint to finish within the configured CPU and RAM limits.
+The CPU allowance increases from 50% to 60% after a bounded comparison showed
+shorter batch times without service errors or resource guard violations. Keep
+the RAM limits unchanged and compare sustained throughput with incoming traffic;
+faster batches alone do not establish that a historical backlog will shrink.
+Phase start/end logs identify database open, import/transform commit and close,
+including elapsed time without SQL, payloads or exception text. Do not activate
+the timer until individual runs pass; observe repeated runs and collector
+freshness before enabling it across reboots. The profile does not enable pruning
+or publication.
+
+For the separate publisher, the optional
+`systemd/loxone-silver-publish-pi3.service.conf` drop-in sets a 240 MiB hard
+limit, no swap, a quarter of one CPU core and a four-minute hard timeout.
+It bounds each invocation to 20 prepared batches using `/usr/bin/env` in
+`ExecStart`: systemd `EnvironmentFile` values override `Environment` values,
+so a batch limit set only with `Environment=` may not take effect. The companion
+`systemd/loxone-silver-publish-pi3.timer.conf` waits five minutes after completion
+and retains a 15-minute boot trigger after resetting the monotonic timer list.
+Install it with a name that sorts after existing timer drop-ins, such as
+`zz-bounded-cadence.conf`, so an older override cannot replace its cadence.
+The pipeline lock serializes publication with local computation. Validate
+publication, cloud ledger acknowledgements and duplicate-free retries before
+enabling this timer. For an exact file-to-cloud comparison, pause the local
+Silver timer and drain its current job: the next local job normally deletes
+Parquet files for acknowledged batches. Resume the local timer after checking.
+Keep credentials in the existing protected environment file.
+The Pi publisher profile enables Python's fault handler, so a native crash can
+record thread stacks in the journal without dumping local variables or creating
+a full process core. This aids diagnosis; it does not repair a native crash.
+
 The existing GitHub workflow and bridge v3 remain the deployment path. A root-owned
 `/etc/loxone-silver/local.enabled` marker opts into the local installer after the
 normal Silver installation. The root installer links the immutable release at
@@ -109,11 +198,44 @@ before the local retention gate is created.
    hourly counts and the batch ledger; retry once to verify no duplicates.
 6. Enable the Silver and publication timers only after those checks succeed.
 
-Config: `/etc/loxone-silver/local.env`. Service logs intentionally omit error text
+On restart, imports reconcile their committed DuckDB cursor with the SQLite
+acknowledgement. A failed transformation transaction leaves its selected queue
+keys intact; the next invocation reuses its sequence and replaces unpublished
+transport files. A committed queue entry can restore a missing manifest.
+Publication records the same batch IDs in the cloud transaction before local
+ACKs, so retries after a partial acknowledgement do not insert another copy.
+Hourly outputs replace the affected keys rather than incrementing stored counts.
+
+Config: `/etc/loxone-silver/local.env`. Local error logs include a reason category,
+commit phase when recognized and the originating function/line, without logging
+the exception text. Service logs intentionally omit error text
 that might contain credentials. Diagnostic scripts must redact secrets and must
 not print environment files or token-bearing connection strings.
 
 ## Historical coverage and rollback
+
+Local queues store receipt timestamps directly so selecting a small batch does
+not join the entire queue to the archive. New local queues and processing ledgers
+have no primary-key ART indexes: the exclusive pipeline/database locks and
+transactional import guards and message replacement preserve uniqueness.
+Cloud processing keeps its primary keys. A newly mapped structure registers a
+resumable archive scan; each iteration examines at most `LOCAL_SILVER_IMPORT_SIZE`
+raw rows and queues only messages whose ledger mapping differs. Existing queued
+keys are retained without duplicates. Working-archive pruning waits for this scan.
+
+An existing two-column local queue requires the explicit migration
+`scripts/migrate-local-work-indexes.py --database PATH --expected-queue COUNT
+--expected-ledger COUNT`. Stop the local worker and publisher timers, drain both
+jobs and obtain the current counts first. Run the migration with effective CPU,
+RAM and I/O caps. It verifies queue keys and all ledger columns in both directions,
+preserves import cursors and publication metadata, and swaps table names in one
+transaction. Original tables remain as `process_queue_before_work_migration` and
+`loxone_silver.processed_messages_before_work_migration`. Never drop them as part
+of a trial. A failed pre-swap migration leaves the active tables unchanged and
+refuses to overwrite its shadows on retry; inspect those artifacts first.
+The worker refuses the old queue format until migration succeeds. If an archive
+is rebuilt while a remapping scan is pending, restart the scan with
+`enqueue_remapping` under the same locks, because its scan cursor uses local rowids.
 
 Initial archival starts at the oldest retained local message. Older cloud-only
 Bronze history needs a separate bounded backfill; this is not silently downloaded
@@ -125,3 +247,20 @@ Stop all three local timers and drain their jobs before changing their release o
 restoring files. Keep the retention gate: it prevents data loss while local work is
 paused. The separate cloud SQL timer must remain disabled during this transition.
 Switching code never deletes cloud tables or the local archive.
+
+An uncommitted transformation that exceeds the DuckDB memory budget rolls back
+and retries with a fresh connection and half the message count, down to one
+message. The CPU/RAM caps remain unchanged. A single-message failure still stops
+the job with an error; retries never skip or acknowledge failed messages.
+
+Large local state snapshots are decoded one selected message at a time into
+128-row insert chunks before the SQL window and mapping join. This avoids
+json_each lateral expansion retaining the full JSON snapshot per state.
+Duplicate object members keep last-key-wins event semantics, while nested JSON
+objects retain their member order and duplicate members. Cloud SQL is unchanged.
+
+Publication files and their directories are synced before the database commit.
+Ready manifests use a synced temporary file and atomic replacement, followed
+by a directory sync. Missing, empty, malformed or mismatching manifests are
+recovered from committed publication metadata only after all transport-file
+checksums match. Damaged transport data fails closed without acknowledgement.
