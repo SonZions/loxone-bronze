@@ -125,17 +125,52 @@ def initialize_edge(c,cfg,pipeline):
     c.execute(f'''CREATE TABLE IF NOT EXISTS {cfg.silver}.hourly_state(source_id VARCHAR,state_uuid VARCHAR,hour_utc TIMESTAMPTZ,
         event_count BIGINT,numeric_count BIGINT,numeric_min DOUBLE,numeric_max DOUBLE,numeric_avg DOUBLE,numeric_first DOUBLE,numeric_last DOUBLE)''')
     initialize(c,cfg.transform)
+    seed_latest(c,cfg)
     c.execute(f'CREATE TABLE IF NOT EXISTS {cfg.silver}.published_batches(batch_id VARCHAR PRIMARY KEY,created_at TIMESTAMPTZ,published_at TIMESTAMPTZ,messages BIGINT,events BIGINT)')
 
 
-def refresh_derived(c,sc):
+def current_projection():
+    return ('source_id,state_uuid,state_name,control_uuid,control_name,control_type,room_uuid,room_name,'
+            'category_uuid,category_name,received_at,received_at_berlin,value_numeric,value_text,value_json,structure_id,resolution_status')
+
+
+def seed_latest(c,cfg):
+    s=cfg.silver
+    exists=c.execute('SELECT 1 FROM duckdb_tables() WHERE database_name=? AND schema_name=? AND table_name=?',
+        [cfg.database,cfg.silver_schema,'edge_latest_events']).fetchone()
+    if exists:return
+    columns=[r[0] for r in c.execute(f'DESCRIBE {s}.state_events').fetchall()]
+    values=','.join(identifier(k)+' := '+identifier(k) for k in columns if k not in ('source_id','state_uuid'))
+    projection=','.join('g.'+identifier(k) if k in ('source_id','state_uuid') else 'g.latest.'+identifier(k) for k in columns)
+    c.execute('BEGIN')
+    try:
+        c.execute(f'''CREATE TABLE {s}.edge_latest_events AS WITH grouped AS (
+            SELECT source_id,state_uuid,arg_max(struct_pack({values}),struct_pack(t := received_at,m := message_id,l := loaded_at)) latest
+            FROM {s}.state_events GROUP BY source_id,state_uuid)
+            SELECT {projection} FROM grouped g''')
+        c.execute(f'DELETE FROM {s}.current_state')
+        c.execute(f'INSERT INTO {s}.current_state SELECT {current_projection()} FROM {s}.edge_latest_events')
+        c.execute('COMMIT')
+    except BaseException:
+        try:c.execute('ROLLBACK')
+        except duckdb.TransactionException:pass
+        raise
+    LOG.info('edge_latest_seeded')
+
+
+def refresh_derived(c,sc, *, include_hourly=True):
     s=sc.silver
-    c.execute(f'''DELETE FROM {s}.current_state t USING (SELECT DISTINCT source_id,state_uuid FROM {s}._refresh_events) k
-        WHERE t.source_id=k.source_id AND t.state_uuid=k.state_uuid''')
-    c.execute(f'''INSERT INTO {s}.current_state SELECT source_id,state_uuid,state_name,control_uuid,control_name,control_type,
-        room_uuid,room_name,category_uuid,category_name,received_at,received_at_berlin,value_numeric,value_text,value_json,structure_id,resolution_status
-        FROM {s}.state_events SEMI JOIN (SELECT DISTINCT source_id,state_uuid FROM {s}._refresh_events) k USING(source_id,state_uuid)
-        QUALIFY row_number() OVER(PARTITION BY source_id,state_uuid ORDER BY received_at DESC,message_id DESC)=1''')
+    # Only the compact latest-state table and this batch enter the window.
+    # Historical events are scanned once when the cloud pipeline takes ownership.
+    c.execute(f'''CREATE OR REPLACE TABLE {s}._edge_next_latest AS
+        SELECT * FROM (SELECT * FROM {s}.edge_latest_events UNION ALL SELECT * FROM {s}._refresh_events)
+        QUALIFY row_number() OVER(PARTITION BY source_id,state_uuid ORDER BY received_at DESC,message_id DESC,loaded_at DESC)=1''')
+    c.execute(f'DELETE FROM {s}.edge_latest_events')
+    c.execute(f'INSERT INTO {s}.edge_latest_events SELECT * FROM {s}._edge_next_latest')
+    c.execute(f'DROP TABLE {s}._edge_next_latest')
+    c.execute(f'DELETE FROM {s}.current_state')
+    c.execute(f'INSERT INTO {s}.current_state SELECT {current_projection()} FROM {s}.edge_latest_events')
+    if not include_hourly:return
     keys=f"SELECT DISTINCT source_id,state_uuid,date_trunc('hour',received_at) AS hour_utc FROM {s}._refresh_events"
     c.execute(f'''DELETE FROM {s}.hourly_state t USING ({keys}) k
         WHERE t.source_id=k.source_id AND t.state_uuid=k.state_uuid AND t.hour_utc=k.hour_utc''')
@@ -166,7 +201,7 @@ def remap_history(c,cfg):
         SELECT e.source_id,e.message_id,min(e.received_at) received_at FROM {cfg.silver}.state_events e
         LEFT JOIN versions v ON v.source_id=e.source_id AND (v.rn=1 OR e.received_at>=v.structure_captured_at)
           AND (v.valid_to IS NULL OR e.received_at<v.valid_to)
-        WHERE e.structure_id IS DISTINCT FROM v.structure_id
+        WHERE v.structure_id IS NOT NULL AND e.structure_id IS DISTINCT FROM v.structure_id
         GROUP BY e.source_id,e.message_id ORDER BY min(e.received_at),e.source_id,e.message_id LIMIT {cfg.chunk_size}
       )
       SELECT e.source_id,e.message_id,min(e.received_at) received_at,min(e.message_type) message_type,
@@ -175,7 +210,7 @@ def remap_history(c,cfg):
       GROUP BY e.source_id,e.message_id''')
     count=c.execute(f'SELECT count(*) FROM {cfg.raw}.remap_messages').fetchone()[0]
     if count:
-        result=process_batch(c,cfg.transform,after_transform=refresh_derived,
+        result=process_batch(c,cfg.transform,after_transform=lambda db,sc:refresh_derived(db,sc,include_hourly=False),
             ws_messages=cfg.database+'.'+cfg.raw_schema+'.remap_messages')
         if result['messages']!=count:raise RuntimeError('Remapping did not acknowledge selected messages')
     else:c.execute(f"INSERT OR REPLACE INTO {cfg.raw}.control VALUES('remap_pending','0')")
@@ -193,6 +228,10 @@ def run(cfg,connect=None,initial_cursor=None):
             old=state.execute("SELECT value FROM metadata WHERE key='destination'").fetchone()
             if old and old[0]!=destination:raise RuntimeError('State belongs to a different destination')
             state.execute("INSERT OR IGNORE INTO metadata VALUES('destination',?)",[destination]);state.commit()
+            retry=state.execute("SELECT value FROM metadata WHERE key='retry_after'").fetchone()
+            if retry and float(retry[0])>time.time():
+                result={'messages':0,'events':0,'chunks':0,'cursor':cursor,'reason':'error_backoff'}
+                LOG.info('edge_idle %s',json.dumps(result));return result
             ready,_,_=read_chunk(cfg,cursor)
             with source_connection(cfg.spool) as src:structure_cap=src.execute("SELECT rowid_highwater FROM parquet_archive_checkpoints WHERE table_name='structures'").fetchone()[0]
             meta=dict(state.execute('SELECT key,value FROM metadata'))
@@ -272,11 +311,23 @@ def run(cfg,connect=None,initial_cursor=None):
 
 def main():
     logging.basicConfig(level=logging.INFO,format='%(asctime)s %(levelname)s %(message)s')
+    cfg=None
     try:
+        cfg=EdgeConfig.from_env()
         if not os.environ.get('MOTHERDUCK_TOKEN','').strip():raise ValueError('Existing token required')
-        run(EdgeConfig.from_env())
+        run(cfg)
     except BlockingIOError:LOG.info('edge_skipped already_running=true')
     except Exception as exc:
-        LOG.error('edge_error type=%s',type(exc).__name__);raise SystemExit(1) from None
+        frame=exc.__traceback__
+        while frame and frame.tb_next:frame=frame.tb_next
+        origin=f'{frame.tb_frame.f_code.co_name}:{frame.tb_lineno}' if frame else 'unknown'
+        LOG.error('edge_error type=%s origin=%s',type(exc).__name__,origin)
+        if cfg is not None:
+            try:
+                with sqlite3.connect(Path(cfg.state).resolve().as_uri()+'?mode=rw',uri=True,timeout=1) as state:
+                    state.execute('PRAGMA synchronous=FULL')
+                    state.execute("INSERT OR REPLACE INTO metadata VALUES('retry_after',?)",[str(time.time()+300)])
+            except Exception:pass
+        raise SystemExit(1) from None
 
 if __name__=='__main__':main()

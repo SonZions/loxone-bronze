@@ -22,7 +22,7 @@ must remain disabled during cutover. Retain original messages of unsupported typ
 as well as all structure snapshots. Existing archive coverage must be checked
 before any subsequent retention change.
 
-A chunk is bounded by rows and payload bytes (defaults: 1,000 and 4 MiB). An
+A chunk is bounded by rows and payload bytes (installed profile: 5,000 and 4 MiB). An
 oversized single record fails without skipping it. The current cloud raw chunk
 is retained until all eligible messages have committed events and derived tables.
 The cloud chunk ledger commits before the local SQLite FULL checkpoint advances.
@@ -35,8 +35,9 @@ pipeline ID. Do not silently recreate it or point it at another destination.
 Cloud staging holds one chunk, durable structure snapshots and acknowledgement
 metadata. It does not hold another complete raw archive.
 
-Derived current state is recomputed from retained events for touched state keys,
-so older backfill cannot overwrite newer values. Hourly numeric summaries are
+A compact latest-event table is seeded once from retained events with a grouped
+arg-max. Subsequent batches merge only that table and new events, so historical
+backfill cannot overwrite newer values or repeatedly scan/sort the full history. Hourly numeric summaries are
 replaced for touched keys using all retained events in the affected hours.
 These remain sample-based statistics, not time-weighted energy calculations.
 Late structure mappings schedule bounded replay from lossless event values;
@@ -86,6 +87,9 @@ publisher blindly after the cloud worker has advanced: its older current-state
 transport can regress a newer cloud value. Returning to the old writer requires
 explicit reconciliation/replay or restoration of a verified target snapshot.
 The retained old code/database is a recovery option, not an automatic safe rollback.
+
+Normal failures back off locally for five minutes; idle/backoff attempts make no
+cloud calls. Errors log their class and source location without exception text.
 
 Logs `edge_start`, `edge_connected`, `edge_structures_ready`, `edge_transform_start`,
 `edge_batch`, `edge_summary` and `edge_idle` contain counts/cursors/timings rather

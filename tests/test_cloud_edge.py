@@ -116,3 +116,18 @@ class EdgeTests(unittest.TestCase):
   run(self.cfg,connect=self.connect)
   self.assertEqual(self.query('SELECT count(*),sum(events) FROM target.silver.published_batches'),[(1,1)])
   self.assertEqual(self.query('SELECT count(*) FROM target.silver.state_events'),[(1,)])
+
+ def test_late_structure_does_not_erase_mapping_of_another_source(self):
+  self.structure();self.message();self.archive();run(self.cfg,connect=self.connect,initial_cursor=0)
+  with self.connect() as c:
+   c.execute("INSERT INTO target.silver.state_events SELECT * REPLACE('other' AS source_id,'historic' AS structure_id) FROM target.silver.state_events")
+   c.execute("INSERT OR REPLACE INTO target.raw.control VALUES('remap_pending','1')")
+   self.assertEqual(remap_history(c,self.cfg),0)
+  self.assertEqual(self.query("SELECT structure_id FROM target.silver.state_events WHERE source_id='other'"),[('historic',)])
+
+ def test_error_backoff_never_opens_cloud(self):
+  import time
+  self.structure();self.message();self.archive()
+  with open_state(self.cfg.state,initial_cursor=0) as c:c.execute("INSERT INTO metadata VALUES('retry_after',?)",[str(time.time()+300)])
+  with patch.object(self,'connect',side_effect=AssertionError('Backoff must not connect')):
+   self.assertEqual(run(self.cfg,connect=self.connect)['reason'],'error_backoff')
