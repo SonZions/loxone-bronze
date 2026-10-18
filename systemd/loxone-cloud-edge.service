@@ -29,4 +29,6 @@ ProtectHome=true
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true
-ReadWritePaths=/srv/raspi-data/loxone-silver
+# SQLite WAL readers may need to create/write the shared-memory sidecar.
+# The application still opens the source database with mode=ro.
+ReadWritePaths=/srv/raspi-data/loxone-silver /srv/raspi-data/loxone-bronze

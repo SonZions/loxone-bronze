@@ -15,7 +15,9 @@ requires stopping the cloud writer first.
 
 ## Guarantees and bounds
 
-The source is read-only SQLite. Its durable Parquet checkpoint bounds each read;
+The source is opened with SQLite `mode=ro`. Its directory remains writable in
+the systemd filesystem namespace because WAL readers may need shared-memory
+sidecars; database rows and source checkpoints are never modified by this client. Its durable Parquet checkpoint bounds each read;
 cloud staging never runs ahead of the local archive. This code never prunes any
 source, archive, local working database or outbox. Existing local-only pruning
 must remain disabled during cutover. Retain original messages of unsupported types
