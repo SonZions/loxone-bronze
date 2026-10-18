@@ -58,7 +58,7 @@ class SilverConfig:
     def sql(self, name, *, processed_messages=None, ws_messages=None):
         ledger=(identifier(processed_messages) if processed_messages is not None
                 else f'{self.silver}.processed_messages')
-        messages=(identifier(ws_messages) if ws_messages is not None
+        messages=('.'.join(identifier(part) for part in ws_messages.split('.')) if ws_messages is not None
                   else f'{self.bronze}.ws_messages')
         return ((SQL_DIR / name).read_text().replace("${bronze}", self.bronze)
                 .replace("${silver}", self.silver).replace("${batch_size}", str(self.batch_size))
@@ -117,13 +117,15 @@ def sync_structures(con, cfg, run_id=None):
         raise
 
 
-def process_batch(con, cfg, run_id=None):
+def process_batch(con, cfg, run_id=None, *, after_transform=None, ws_messages=None):
     s = cfg.silver
     try:
         begin(con, cfg)
-        con.execute(cfg.sql("batch.sql"))
+        con.execute(cfg.sql("batch.sql") if ws_messages is None else cfg.sql("batch.sql", ws_messages=ws_messages))
         messages, latest = con.execute(f"SELECT count(*), max(ingested_at) FROM {s}._refresh_batch").fetchone()
         events = con.execute(f"SELECT count(*) FROM {s}._refresh_events").fetchone()[0]
+        if after_transform is not None:
+            after_transform(con, cfg)
         if run_id:
             con.execute(f"UPDATE {s}.load_runs SET messages_processed=messages_processed+?, "
                         "events_inserted=events_inserted+?, "

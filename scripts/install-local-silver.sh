@@ -4,6 +4,10 @@ set -Eeuo pipefail
 [[ "$EUID" -eq 0 ]] || exit 1
 release="$(readlink -f "${1:?Expected immutable installed Silver release}")"
 [[ "$release" == /opt/loxone-silver/releases/* && -x "$release/venv/bin/python" ]] || exit 2
+if systemctl is-active --quiet loxone-cloud-edge.timer || systemctl is-active --quiet loxone-cloud-edge.service; then
+  echo 'Stop the cloud edge writer before installing the legacy local writer.' >&2
+  exit 1
+fi
 base=/opt/loxone-local-silver
 units=(loxone-local-silver.service loxone-local-silver.timer loxone-silver-publish.service loxone-silver-publish.timer loxone-bronze-archive.service loxone-bronze-archive.timer)
 timers=(loxone-local-silver.timer loxone-silver-publish.timer loxone-bronze-archive.timer)
